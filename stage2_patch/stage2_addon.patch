@@ -1,0 +1,2235 @@
+--- a/lingbotvla/data/vla_data/transform.py
++++ b/lingbotvla/data/vla_data/transform.py
+@@ -223,18 +223,105 @@
+     raise ValueError(f"Expected image (C,H,W) or video (T,C,H,W), got {tuple(visual.shape)}")
+ 
+ 
++# --------------------------------------------------------------------------- #
++# 增广配置（stage-2）
++#
++# 官方原本只有 brightness / contrast / saturation 三项。本队实测
++# clean2clean 72.96% vs clean2random 34.84%，域差异 37.9 pt；RoboTwin 2.0 论文说明
++# 鲁棒性来自五轴域随机化（clutter / background / lighting / tabletop height / language）。
++# 规则不允许重新渲染生成新观测，但允许对**已有 clean 图像**做像素级变换，因此这里用
++# 像素级近似覆盖那五轴：
++#   lighting   → brightness + contrast + saturation（官方已有）+ 通道色温增益
++#   clutter    → 随机遮挡块（用该图均值色填充，面积 2%~8%）
++#   background → 色温 / 对比度 / 噪声（纹理替换无法模拟，只求对纹理不敏感）
++#   tabletop height / 头部相机位姿 → 轻度仿射（scale/平移/旋转），p≈0.25，其余样本
++#                保持恒等，使评测图像仍在训练分布支撑集内
++#   language   → 由 seen 池内的指令替换负责（不在本函数内）
++#
++# 可用环境变量 LINGBOT_AUG_CFG 覆盖（JSON），不需要改任何调用方签名：
++#   export LINGBOT_AUG_CFG='{"p_geo": 0.0}'    # 关几何增广
++#   export LINGBOT_AUG_CFG='{"p_erase": 0.0}'  # 关随机遮挡
++# --------------------------------------------------------------------------- #
++AUG_CFG = {
++    # 官方三项：保持官方区间，避免推翻已验证的收益
++    "brightness": (0.7, 1.3),
++    "contrast": (0.6, 1.4),
++    "saturation": (0.5, 1.5),
++    # 通道色温增益：每通道乘 (1 ± gain)
++    "gain": 0.05,
++    # 轻度仿射几何
++    "p_geo": 0.25,
++    "geo_scale": (0.92, 1.0),
++    "geo_translate": 0.06,   # 归一化坐标（1.0 = 半个画幅），即 ±3% 画幅
++    "geo_rot_deg": 3.0,
++    # 高斯噪声
++    "p_noise": 0.30,
++    "noise_sigma": (0.01, 0.03),
++    # 随机遮挡（clutter 近似）
++    "p_erase": 0.25,
++    "erase_area": (0.02, 0.08),
++}
++
++
++def _aug_cfg():
++    """读取一次环境变量覆盖后返回生效配置（每个 worker 各应用一次）。"""
++    import json
++    import os
++
++    env = os.environ.get("LINGBOT_AUG_CFG")
++    if env:
++        try:
++            AUG_CFG.update(json.loads(env))
++        except Exception:  # 配置写错不应让训练崩掉
++            pass
++        os.environ.pop("LINGBOT_AUG_CFG", None)
++    return AUG_CFG
++
++
++def _uniform(lo: float, hi: float, device) -> Tensor:
++    return lo + torch.rand((), device=device) * (hi - lo)
++
++
+ def sample_visual_augmentation_params(
+     reference: Tensor,
+ ) -> dict:
+-    """Sample one replayable augmentation config for all views/frames in a sample."""
++    """Sample one replayable augmentation config for all views/frames in a sample.
++
++    返回的参数会在**同一样本的所有相机视图与未来帧**上复用（与 DrQ 的“同一样本
++    一致性增广”同理），既省算力，也避免多视图之间出现互相矛盾的几何/色彩。
++    """
+     _visual_hw(reference)
++    cfg = _aug_cfg()
+     device = reference.device
+-    return {
+-        "brightness": 0.7 + torch.rand((), device=device) * 0.6,
+-        "contrast": 0.6 + torch.rand((), device=device) * 0.8,
+-        "saturation": 0.5 + torch.rand((), device=device),
++
++    params = {
++        "brightness": _uniform(*cfg["brightness"], device),
++        "contrast": _uniform(*cfg["contrast"], device),
++        "saturation": _uniform(*cfg["saturation"], device),
++        # 通道色温：(3,) 每通道一个增益
++        "gain": (torch.rand(3, device=device) * 2 - 1) * float(cfg["gain"]),
+     }
+ 
++    # 几何：未启用时不写 "geo" 键 → apply 阶段跳过，保持恒等
++    if bool(torch.rand(()) < float(cfg["p_geo"])):
++        params["geo"] = (
++            _uniform(*cfg["geo_scale"], device),
++            (_uniform(-1.0, 1.0, device)) * float(cfg["geo_translate"]),
++            (_uniform(-1.0, 1.0, device)) * float(cfg["geo_translate"]),
++            (_uniform(-1.0, 1.0, device)) * (float(cfg["geo_rot_deg"]) * math.pi / 180.0),
++        )
++
++    if bool(torch.rand(()) < float(cfg["p_noise"])):
++        params["noise_sigma"] = _uniform(*cfg["noise_sigma"], device)
++
++    if bool(torch.rand(()) < float(cfg["p_erase"])):
++        side = torch.sqrt(_uniform(*cfg["erase_area"], device)).clamp(0.02, 0.5)
++        x0 = torch.rand((), device=device) * (1.0 - side)
++        y0 = torch.rand((), device=device) * (1.0 - side)
++        params["erase"] = (x0, y0, side, side * _uniform(0.7, 1.3, device))
++
++    return params
++
+ def apply_visual_augmentation(
+     visual: Tensor,
+     params: dict,
+@@ -263,13 +350,67 @@
+     brightness = params["brightness"].to(device=image.device, dtype=image.dtype)
+     contrast = params["contrast"].to(device=image.device, dtype=image.dtype)
+     saturation = params["saturation"].to(device=image.device, dtype=image.dtype)
++
++    # ---- 几何增广（在色彩之前，作用于原始画面）----
++    geo = params.get("geo")
++    if geo is not None:
++        scale, tx, ty, rot = geo
++        cos_r = torch.cos(rot) * scale
++        sin_r = torch.sin(rot) * scale
++        theta = torch.stack(
++            [
++                torch.stack([cos_r, -sin_r, tx]),
++                torch.stack([sin_r, cos_r, ty]),
++            ]
++        ).unsqueeze(0).to(device=image.device, dtype=image.dtype)
++        grid = F.affine_grid(
++            theta.expand(image.shape[0], -1, -1), image.shape, align_corners=False
++        )
++        image = F.grid_sample(
++            image, grid, mode="bilinear", padding_mode="reflection", align_corners=False
++        )
++
+     image = image * brightness
+     mean = image.mean(dim=[1, 2, 3], keepdim=True)
+     image = (image - mean) * contrast + mean
+     gray = image.mean(dim=1, keepdim=True)
+     image = gray + (image - gray) * saturation
++
++    # ---- 通道色温 ----
++    gain = params.get("gain")
++    if gain is not None:
++        g = gain.to(device=image.device, dtype=image.dtype).view(1, -1, 1, 1)
++        image = image * (1.0 + g)
++
+     image = image.clamp(0.0, 1.0)
+ 
++    # ---- 高斯噪声 ----
++    sigma = params.get("noise_sigma")
++    if sigma is not None:
++        sd = float(sigma)
++        if sd > 0:
++            image = image + torch.randn_like(image) * sd
++            image = image.clamp(0.0, 1.0)
++
++    # ---- 随机遮挡：用该帧均值色填充一块矩形（clutter 近似）----
++    erase = params.get("erase")
++    if erase is not None:
++        x0, y0, ew, eh = erase
++        px = int(round(float(x0) * width))
++        py = int(round(float(y0) * height))
++        pw = max(1, int(round(float(ew) * width)))
++        ph = max(1, int(round(float(eh) * height)))
++        px = min(px, max(0, width - 1))
++        py = min(py, max(0, height - 1))
++        pw = min(pw, width - px)
++        ph = min(ph, height - py)
++        fill = image.mean(dim=[2, 3], keepdim=True)
++        image = image.clone()
++        image[:, :, py: py + ph, px: px + pw] = fill.expand(
++            -1, -1, ph, pw
++        ).to(dtype=image.dtype)
++        image = image.clamp(0.0, 1.0)
++
+     if orig_dtype == torch.uint8:
+         image = (image * 255.0).round().to(torch.uint8)
+     else:
+--- a/lingbotvla/data/vla_data/multi_vla_dataset.py
++++ b/lingbotvla/data/vla_data/multi_vla_dataset.py
+@@ -110,6 +110,29 @@
+             start_index += dataset.dataset.num_frames
+         self.dataset_start_index = dataset_start_index
+ 
++        # ------------------------------------------------------------------ #
++        # 任务均衡采样（stage-2）
++        #
++        # 现状：帧被直接拼接，采样按帧均匀 → 长 episode 任务拿到远超其任务数的权重。
++        # 本队 50 任务转换后帧数 23,041（blocks_ranking_rgb, 461 帧/条）vs 5,682
++        # （114 帧/条），相差 4.05×，RoboTwin 平均步数 94~537 步意味着极端可达 5.7×。
++        # 做法：把「样本槽位」映射成「槽位号 % 任务数 → 该任务内均匀随机一帧」，
++        # 每个任务获得的槽位数完全相同，总槽位数仍等于总帧数（不改变 epoch 定义）。
++        # 合规：这是训练期采样机制（规则 2.1），只用数据自身的帧数统计，
++        #       不涉及成功率、奖励或任何评测反馈。
++        # ------------------------------------------------------------------ #
++        self.task_balanced = bool(getattr(dataset_config, "task_balanced", False))
++        self._frames_per_task = [int(d.dataset.num_frames) for d in self._datasets]
++        self._n_tasks = len(self._datasets)
++        if self.task_balanced and self._n_tasks > 0:
++            _f = np.asarray(self._frames_per_task, dtype=np.float64)
++            logger.info(
++                f"[task_balanced] 已启用：{self._n_tasks} 个任务，每任务槽位 "
++                f"{self.num_frames // max(self._n_tasks, 1)}，原始帧数 "
++                f"min={int(_f.min())} max={int(_f.max())} 比值={_f.max()/max(_f.min(),1):.2f}x "
++                f"（均衡后 1.00x）"
++            )
++
+ 
+     @property
+     def num_frames(self) -> int:
+@@ -143,13 +166,27 @@
+         
+         return item
+ 
++    def _slot_to_index(self, idx: int) -> int:
++        """把采样槽位映射到真实帧下标。
++
++        ``task_balanced`` 关闭时是恒等映射（行为与改动前逐位一致）；
++        打开时保证每个任务拿到相同数量的槽位，任务内均匀随机抽帧。
++        """
++        if not self.task_balanced or self._n_tasks <= 1:
++            return idx
++        task = idx % self._n_tasks
++        frames = self._frames_per_task[task]
++        if frames <= 1:
++            return self.dataset_start_index[task]
++        return self.dataset_start_index[task] + int(np.random.randint(0, frames))
++
+     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+ 
+         if idx < 0 or idx >= len(self):
+             raise IndexError(f"Index {idx} out of bounds.")
+         max_retries = 200
+         attempts = 0
+-        cur = idx
++        cur = self._slot_to_index(idx)
+         last_err = None
+         #return self.getdata(cur)
+         while attempts < max_retries:
+@@ -163,7 +200,7 @@
+                 dataset = self._datasets[dataset_idx]
+                 logger.info(f"Last error: {repr(last_err)},\n"
+                       f"Dataset: {dataset.dataset.repo_id}")
+-                cur = np.random.randint(0, len(self))
++                cur = self._slot_to_index(np.random.randint(0, len(self)))
+                 if cur >= len(self):
+                     cur = 0
+                 continue
+--- a/lingbotvla/data/vla_data/base_dataset.py
++++ b/lingbotvla/data/vla_data/base_dataset.py
+@@ -220,6 +220,20 @@
+         # 训练行为与改动前完全一致（纯 BC）。
+         self.adv_weights = None
+         adv_weight_path = getattr(dataset_config, "adv_weight_path", None)
++        if adv_weight_path and os.path.isdir(adv_weight_path):
++            # 目录形式：每个任务一份 sidecar（多任务训练必须用这种形式）。
++            # 原因：sidecar 的校验口径是"与本数据集的样本数一致"（见下），而
++            # MultiVLADataset 会把同一份 dataset_config 传给每个任务的 VLADataset，
++            # 因此单个全局 sidecar 无法通过校验。目录形式对单任务训练同样适用。
++            _p = os.path.join(str(adv_weight_path), f"{self.data_name}.pt")
++            if not os.path.isfile(_p):
++                _peek = sorted(os.listdir(str(adv_weight_path)))[:3]
++                raise FileNotFoundError(
++                    f"adv_weight_path 指向目录，但缺少本任务对应的 sidecar：{_p}\n"
++                    f"（目录内前几个文件：{_peek}…）\n"
++                    "请用 tools/build_motion_weights.py --output-dir <dir> 重新生成。"
++                )
++            adv_weight_path = _p
+         if adv_weight_path:
+             from ...offline_rl.advantage import load_weights
+ 
+--- a/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
++++ b/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
+@@ -926,6 +926,8 @@
+         state,
+         noise=None,
+         image_grid_thw=None,
++        return_denoise_var: bool = False,
++        denoise_var_tail_steps: int = 3,
+     ) -> Tensor:
+         """Do a full Qwen3-VL inference forward and compute the action."""
+         bsize = state.shape[0]
+@@ -984,6 +986,14 @@
+                 )
+                 self._compiled_predict_velocity = predict_velocity_fn
+ 
++        # ---- DVAC: 收集最后 L 步的“干净动作估计” ẑ = x_t - t·v_t ----
++        # 依据 Denoising Tells When to Replan (arXiv 2606.03847)：去噪尾部的方差越小，
++        # 说明模型对该未来时刻越确定；方差突然抬升处即为该重规划的边界。
++        # 默认关闭（return_denoise_var=False），关闭时返回值与改动前逐位一致。
++        _n_steps = int(self.config.num_steps)
++        _tail = int(max(1, min(int(denoise_var_tail_steps), _n_steps))) if return_denoise_var else 0
++        z_tail = []
++
+         while time >= -dt / 2:
+             count += 1
+             expanded_time = time.expand(bsize)
+@@ -996,10 +1006,25 @@
+                 prefix_position_ids=prefix_position_ids,
+             )
+ 
++            if _tail and count > _n_steps - _tail:
++                z_tail.append(x_t - time * v_t)
++
+             x_t += dt * v_t
+             time += dt
+         print(f"Denoise {count} steps")
+-        return x_t
++
++        if not return_denoise_var:
++            return x_t
++
++        # V(k): 第 k 个未来动作在尾部 L 步估计上的方差（对动作维取均值）
++        if len(z_tail) >= 2:
++            z = torch.stack(z_tail, dim=0)  # (L, B, K, D)
++            denoise_var = z.var(dim=0, unbiased=False).mean(dim=-1)  # (B, K)
++        else:
++            denoise_var = torch.zeros(
++                x_t.shape[0], x_t.shape[1], device=x_t.device, dtype=x_t.dtype
++            )
++        return x_t, denoise_var
+ 
+     def predict_velocity(
+         self,
+--- a/tasks/vla/train_lingbotvla.py
++++ b/tasks/vla/train_lingbotvla.py
+@@ -122,6 +122,17 @@
+         default=False,
+         metadata={"help": "Whether or not to freeze the vit parameters."},
+     )
++    # ---- stage-2: 训练期 EMA（规则 2.3 明许，产出仍为一份权重）----
++    # >0 时创建 bf16 影子模型，每步 optimizer.step() 后更新；官方 DCP/HF 通路会自动
++    # 额外导出 checkpoints/global_step_N/ema_hf_ckpt/。0 表示关闭（与改动前逐位一致）。
++    ema_decay: float = field(
++        default=0.0,
++        metadata={"help": "Decay for training-time EMA shadow weights; 0 disables EMA."},
++    )
++    ema_dtype: str = field(
++        default="bfloat16",
++        metadata={"help": "Dtype of the EMA shadow weights: bfloat16 or float32."},
++    )
+     vit_lr: float = field(
+         default=1e-6,
+         metadata={"help": "Maximum learning rate for vit parameters."},
+@@ -326,6 +337,13 @@
+         default=None,
+         metadata={"help": "Path to advantage-weight sidecar (.pt) for offline RL; None disables it."},
+     )
++    # ---- stage-2: 任务均衡采样 ----
++    # 现状按帧拼接 → 长 episode 任务权重可达短任务的 4~5.7 倍。打开后每个任务拿到
++    # 相同数量的采样槽位（槽位号 % 任务数），任务内均匀抽帧。规则 2.1 允许。
++    task_balanced: bool = field(
++        default=False,
++        metadata={"help": "Enable task-balanced sampling (each task gets equal sample slots)."},
++    )
+ 
+ 
+ @dataclass
+@@ -573,6 +591,28 @@
+         lr_start=args.train.lr_start,
+     )
+ 
++    # ------------------------------------------------------------------ #
++    # stage-2: 训练期 EMA
++    # 官方 DCP Checkpointer 见到 state["ema"] 非 None 会写 checkpoints/.../ema/，
++    # AsyncHFCheckpointSaver 见到 save_ema=True 会额外导出 .../ema_hf_ckpt/，
++    # 因此这里只需要创建影子模型并每步更新，不需要额外的导出代码。
++    # ------------------------------------------------------------------ #
++    ema_model = None
++    if getattr(args.train, "ema_decay", 0.0) and args.train.ema_decay > 0:
++        from lingbotvla.utils.ema_model import EMAModel
++
++        _ema_dtype = torch.float32 if str(getattr(args.train, "ema_dtype", "bfloat16")).lower() == "float32" else torch.bfloat16
++        helper.empty_cache()
++        ema_model = EMAModel(model, decay=float(args.train.ema_decay), dtype=_ema_dtype)
++        ema_model.eval()
++        _n_ema = sum(p.numel() for p in ema_model.parameters())
++        logger.info_rank0(
++            f"EMA enabled: decay={args.train.ema_decay}, dtype={_ema_dtype}, "
++            f"shadow_params={_n_ema/1e9:.2f}B (~{_n_ema * (2 if _ema_dtype == torch.bfloat16 else 4) / 2**30:.1f} GiB), "
++            f"HF EMA will be exported to <ckpt>/ema_hf_ckpt/"
++        )
++        helper.print_device_mem_info("VRAM usage after building EMA shadow weights")
++
+     if args.train.global_rank == 0:
+         log_dir=f"{args.train.output_dir}/runs/"
+         writer = AsyncTBWriter(log_dir=log_dir)
+@@ -669,7 +709,7 @@
+         last_err = None
+         loaded = False
+         for cp in candidates:
+-            state = {"model": model, "ema": None, "optimizer": optimizer, "extra_state": {}}  # cannot be None
++            state = {"model": model, "ema": ema_model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
+             try:
+                 Checkpointer.load(cp, state, allow_partial_load=getattr(args.train, 'allow_partial_checkpoint', False))
+                 global_step = state["extra_state"]["global_step"]
+@@ -898,6 +938,8 @@
+ 
+             optimizer.step()
+             lr_scheduler.step()
++            if ema_model is not None:
++                ema_model.update(model)
+             optimizer.zero_grad()
+             if hasattr(grad_norm, "full_tensor"):
+                 grad_norm = grad_norm.full_tensor().item()
+@@ -1105,7 +1147,7 @@
+ 
+                 state = {
+                     "model": model,
+-                    "ema": None,
++                    "ema": ema_model,
+                     "optimizer": optimizer,
+                     "extra_state": {
+                         "global_step": global_step,
+@@ -1146,7 +1188,7 @@
+                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+                 state = {
+                     "model": model,
+-                    "ema": None,
++                    "ema": ema_model,
+                     "optimizer": optimizer,
+                     "extra_state": {
+                         "global_step": global_step,
+@@ -1172,7 +1214,7 @@
+             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
+             state = {
+                 "model": model,
+-                "ema": None,
++                "ema": ema_model,
+                 "optimizer": optimizer,
+                 "extra_state": {
+                     "global_step": global_step,
+--- a/deploy/lingbot_vla_v2_policy.py
++++ b/deploy/lingbot_vla_v2_policy.py
+@@ -1,3 +1,11 @@
++# ---------------------------------------------------------------------------
++# DVAC（去噪方差自适应 chunk 执行）语义备忘：
++#   * τ 只用**历史** chunk 估计 —— 先用缓冲区里已有元素算 μ/σ/τ，最后才把当前
++#     chunk 的标量入缓冲区（否则 τ ≈ 自身均值，退化成自归一化）；
++#   * 冷启动（历史 < --dvac_min_history，默认 2）退化为不截断：n = max_len；
++#   * 单进程跨 episode 会走 reset()，清空 _dvac_buf/_exec_len/_dvac_trace/_dvac_var；
++#   * --dvac_alpha 0（默认）时整条分支不生效，行为与原版逐位一致。
++# ---------------------------------------------------------------------------
+ import os
+ import sys
+ import time
+@@ -100,6 +108,8 @@
+         use_compile: bool = False,
+         capture_time: bool = False,
+         sample_compile_fn: callable = None,
++        return_denoise_var: bool = False,
++        denoise_var_tail_steps: int = 3,
+     ) -> Tensor:
+         """Run one model forward for a batch of already-transformed observations.
+ 
+@@ -162,6 +172,9 @@
+                 gpu_times = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
+                 print(f"sample_actions avg time: {sum(gpu_times)/len(gpu_times):.4f} ms, min time: {min(gpu_times):.4f} ms, max time: {max(gpu_times):.4f} ms")
+         else:
++            extra = {}
++            if return_denoise_var:
++                extra = dict(return_denoise_var=True, denoise_var_tail_steps=int(denoise_var_tail_steps))
+             actions = sample_compile_fn(
+                             images.to(dtype=dtype, device=device),
+                             img_masks.to(device=device),
+@@ -169,13 +182,22 @@
+                             lang_masks.to(device=device),
+                             state.to(dtype=dtype, device=device),
+                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
++                            **extra,
+             )
+ 
++        denoise_var = None
++        if return_denoise_var:
++            actions, denoise_var = actions
++
+         delta_time = time.time() - s1
+         print(f"sample_actions batch={actions.shape[0]} cost {delta_time} s")
+         if use_bf16:
+             observation["state"] = observation["state"].to(dtype=torch.float32)
+-        return actions.to(dtype=torch.float32, device="cpu")
++        actions = actions.to(dtype=torch.float32, device="cpu")
++        if denoise_var is not None:
++            denoise_var = denoise_var.to(dtype=torch.float32, device="cpu")
++            return actions, denoise_var
++        return actions
+ 
+ class LingBotVlaV2InferencePolicy(PolicyPreprocessMixin, LingbotVlaV2Policy):
+     pass # Only combine necessary functions
+@@ -196,8 +218,23 @@
+         use_bf16=True,
+         use_fp32=False,
+         use_compile=False,
++        dvac_alpha=0.0,
++        dvac_tail_steps=3,
++        dvac_n_min=5,
++        dvac_n_max=50,
++        dvac_buffer=8,
++        dvac_min_history=2,
++        dvac_verbose=False,
+     ) -> None:
+         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
++        # DVAC 需要 chunk_ret=True（每步返回整段 chunk）；chunk_ret=False 时
++        # step_idx = global_step % _eff_len 会因 _eff_len 被 DVAC 改写而错位，
++        # 明确不支持，直接报错（校验放在加载模型之前）。
++        if float(dvac_alpha) > 0 and not chunk_ret:
++            raise ValueError(
++                "dvac_alpha > 0 需要 chunk_ret=True（DVAC 每步返回整段 chunk）；"
++                f"收到 chunk_ret={chunk_ret}。请用 --chunk_ret true，或关闭 DVAC。"
++            )
+         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
+         self.action_ensemble_horizon = action_ensemble_horizon
+         self.use_length = use_length
+@@ -224,6 +261,38 @@
+         self.use_fp32 = use_fp32
+         self.action_key: str= "action"
+ 
++        # ---- DVAC: 去噪方差自适应 chunk 执行（默认关闭）----
++        # 依据 Denoising Tells When to Replan (arXiv 2606.03847)。用**本次推理自身**
++        # 去噪尾部的方差曲线 V(k)（阈值 τ 来自历史 chunk）决定执行多少个动作后重规划：
++        #   n_exec = clamp(第一个 V(k) > τ 的 k, n_min, n_max)，τ = μ + α·σ，
++        #   μ/σ **只用历史 chunk**（最近 dvac_buffer 个，含当前 chunk 之前的）估计，
++        #   当前 chunk 的标量在算完 τ 之后才入缓冲区。
++        # 冷启动（历史 < dvac_min_history）不做截断，直接 n = max_len（等价原版行为）；
++        # 单进程跨 episode / 跨任务时由 reset() 清空缓冲区，避免历史污染。
++        # 依赖 chunk_ret=True（每步都要返回整段 chunk），与 chunk_ret=False 的
++        # step_idx 取模逻辑互斥（_eff_len 会被 DVAC 改写而错位），故直接报错；
++        # 校验放在最前面，避免加载完模型才失败。
++        # 合规（规则 2.4）：单一权重、不按任务/指令路由、不与环境交互、不引入新监督。
++        # dvac_alpha <= 0 时整条分支不生效，行为与改动前逐位一致。
++        self.dvac_alpha = float(dvac_alpha)
++        self.dvac_tail_steps = int(dvac_tail_steps)
++        self.dvac_n_min = int(dvac_n_min)
++        self.dvac_n_max = int(dvac_n_max)
++        self.dvac_min_history = int(dvac_min_history)
++        self.dvac_verbose = bool(dvac_verbose)
++        self._dvac_buf = []
++        self._dvac_buf_maxlen = int(dvac_buffer)
++        self._dvac_var = None
++        self._exec_len = int(use_length) if int(use_length) > 0 else 1
++        self._dvac_trace = []
++        if self.dvac_alpha > 0:
++            print(
++                f"[DVAC] enabled: alpha={self.dvac_alpha} L={self.dvac_tail_steps} "
++                f"n_exec∈[{self.dvac_n_min},{self.dvac_n_max}] buffer={self._dvac_buf_maxlen} "
++                f"min_history={self.dvac_min_history} "
++                f"(base use_length={self.use_length}); sample_actions 走 eager 分支"
++            )
++
+     def load_model_weights(self, path_to_pi_model, strict=True):
+         all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
+         merged_weights = {}
+@@ -349,6 +418,11 @@
+         self.global_step = 0
+         self.last_action_chunk = None
+         self.last_normalized_action_chunk = None
++        # DVAC 的统计量必须随 episode 一起清空，否则跨 episode / 跨任务污染 τ
++        self._dvac_buf = []
++        self._exec_len = self.use_length if self.use_length > 0 else 1
++        self._dvac_trace = []
++        self._dvac_var = None
+ 
+         robot_config = f'configs/robot_configs/{robo_name}.yaml'
+         
+@@ -445,19 +519,79 @@
+             else:
+                 batch_observation[key] = values
+ 
+-        actions = self.vla.sample_actions_batch(
+-            batch_observation,
+-            self.use_bf16,
+-            self.use_compile,
+-            capture_time=False,
+-            sample_compile_fn = self.sample_actions_fn,
+-        )
++        if self.dvac_alpha > 0:
++            # DVAC 需要读去噪中间量：绕开 torch.compile 分支，保证语义与单位置一致。
++            actions = self.vla.sample_actions_batch(
++                batch_observation,
++                self.use_bf16,
++                self.use_compile,
++                capture_time=False,
++                sample_compile_fn=self.vla.model.sample_actions,
++                return_denoise_var=True,
++                denoise_var_tail_steps=self.dvac_tail_steps,
++            )
++            actions, self._dvac_var = actions
++        else:
++            actions = self.vla.sample_actions_batch(
++                batch_observation,
++                self.use_bf16,
++                self.use_compile,
++                capture_time=False,
++                sample_compile_fn = self.sample_actions_fn,
++            )
+         
+         unnormalized_actions = self._unapply_batched_actions(applied, actions)
+         if return_normalized:
+             return unnormalized_actions, actions
+         return unnormalized_actions
+         
++    def _dvac_exec_len(self, denoise_var, max_len: int) -> int:
++        """由去噪方差决定本次 chunk 执行多少步（式 (4)-(9) 的实现）。
++
++        顺序很重要：**先用历史**算 μ/σ 与 τ，**最后**才把当前 chunk 的标量入缓冲区。
++        否则 τ ≈ 本 chunk 自身均值 + α·跨 chunk σ，与"这一段是否异常不确定"无关，
++        dvac_alpha 几乎不影响结果、n_exec 退化成常数（约 K 的 50~60%）。
++        """
++        v = denoise_var.float()
++        if v.ndim > 1:
++            v = v[0] if v.shape[0] == 1 else v.mean(dim=0)
++        v = v.reshape(-1)
++        if v.numel() == 0:
++            return max(1, min(self.dvac_n_max, max_len))
++
++        scale = float(v.mean().item())
++        hist = self._dvac_buf                      # 只含历史 chunk，不含当前 chunk
++        n_hist = len(hist)
++        if n_hist >= self.dvac_min_history:
++            mu = sum(hist) / n_hist
++            var = sum((x - mu) ** 2 for x in hist) / n_hist
++            sigma = var ** 0.5
++            tau = mu + self.dvac_alpha * sigma
++            # 判据：n = min{k : V(k) > τ}；曲线抖动导致后续回落不影响（只看第一个）
++            over = (v > tau).nonzero(as_tuple=False)
++            n = int(over[0].item()) if over.numel() > 0 else int(v.numel())
++            if n <= 0:
++                n = self.dvac_n_min
++            n = max(n, self.dvac_n_min)
++            n = min(n, self.dvac_n_max, max_len)
++        else:
++            # 冷启动：历史不足，不做截断，n = max_len（完全退回原版行为，
++            # 不能用本 chunk 自己的均值定 τ，否则等于自归一化）
++            mu = sigma = tau = float("nan")
++            n = int(max_len)
++
++        # 算完 τ 之后才把当前 chunk 记入历史 —— 这是"只用历史统计"的关键
++        hist.append(scale)
++        if len(hist) > self._dvac_buf_maxlen:
++            hist.pop(0)
++        if self.dvac_verbose:
++            print(
++                f"[DVAC] scale={scale:.5f} buf={n_hist} mu={mu:.5f} sigma={sigma:.5f} "
++                f"tau={tau:.5f} n_exec={n}/{max_len}"
++            )
++            self._dvac_trace.append((scale, tau, n))
++        return n
++
+     def infer(self, observation, center_crop=True, return_normalized=False):
+         """Generates an action with the VLA policy."""
+         # (If trained with image augmentations) Center crop image and then resize back up to original size.
+@@ -471,11 +605,12 @@
+         observations = observation['batch'] if is_batch else [observation]
+         if not self.chunk_ret and self.use_length <= 0:
+             raise ValueError(f"use_length must be > 0 when chunk_ret=False, got {self.use_length}")
++        _eff_len = self._exec_len if self.dvac_alpha > 0 else self.use_length
+         should_forward = (
+             self.chunk_ret
+             or self.last_action_chunk is None
+             or (return_normalized and self.last_normalized_action_chunk is None)
+-            or self.global_step % self.use_length == 0
++            or self.global_step % _eff_len == 0
+             or self.use_length == -1 
+         )
+ 
+@@ -496,6 +631,16 @@
+                     assert self.use_length <= normalized_actions.shape[1]
+                     normalized_actions = normalized_actions[:, :self.use_length]
+             
++            if self.dvac_alpha > 0 and self._dvac_var is not None:
++                _max_len = int(unnormalized_actions[self.action_key].shape[1])
++                _n = self._dvac_exec_len(self._dvac_var, _max_len)
++                for _k in unnormalized_actions.keys():
++                    unnormalized_actions[_k] = unnormalized_actions[_k][:, :_n]
++                if normalized_actions is not None:
++                    normalized_actions = normalized_actions[:, :_n]
++                self._exec_len = _n
++                self._dvac_var = None
++
+             self.last_action_chunk = unnormalized_actions  # always (B, chunk, dim)
+             self.last_normalized_action_chunk = normalized_actions
+ 
+@@ -503,7 +648,7 @@
+             action = self.last_action_chunk               # (B, chunk, dim)
+             normalized_action = self.last_normalized_action_chunk
+         else:
+-            step_idx = self.global_step % self.use_length
++            step_idx = self.global_step % _eff_len
+             action = {}
+             for action_key in self.last_action_chunk.keys():
+                 action[action_key] = self.last_action_chunk[action_key][:, step_idx]
+@@ -590,6 +735,22 @@
+         default=True,
+     )
+ 
++    # ---- DVAC（默认关闭；--dvac_alpha 0 表示原版行为）----
++    parser.add_argument("--dvac_alpha", type=float, default=0.0,
++                        help="DVAC 阈值系数 α（0=关闭）；推荐 1.0")
++    parser.add_argument("--dvac_tail_steps", type=int, default=3,
++                        help="用最后 L 步去噪估计计算方差")
++    parser.add_argument("--dvac_n_min", type=int, default=5,
++                        help="最短执行长度")
++    parser.add_argument("--dvac_n_max", type=int, default=50,
++                        help="最长执行长度")
++    parser.add_argument("--dvac_buffer", type=int, default=8,
++                        help="τ 的滚动窗口 chunk 数")
++    parser.add_argument("--dvac_min_history", type=int, default=2,
++                        help="历史 chunk 数少于此值时不做截断（n=max_len，冷启动）")
++    parser.add_argument("--dvac_verbose", type=str2bool, default=False,
++                        help="打印每个 chunk 的 scale/buf/mu/sigma/tau/n_exec")
++
+     args = parser.parse_args()
+ 
+     model = LingbotVLAv2Server(
+@@ -599,6 +760,13 @@
+         use_bf16=args.use_bf16,
+         use_fp32=args.use_fp32,
+         use_compile=args.use_compile,
++        dvac_alpha=args.dvac_alpha,
++        dvac_tail_steps=args.dvac_tail_steps,
++        dvac_n_min=args.dvac_n_min,
++        dvac_n_max=args.dvac_n_max,
++        dvac_buffer=args.dvac_buffer,
++        dvac_min_history=args.dvac_min_history,
++        dvac_verbose=args.dvac_verbose,
+     )
+     model_server = WebsocketPolicyServer(model, port=args.port)
+     model_server.serve_forever()
+--- a/lingbotvla/utils/ema_model.py
++++ b/lingbotvla/utils/ema_model.py
+@@ -0,0 +1,298 @@
++"""EMA 影子模块（补官方 `lingbotvla/utils/ema.py` 缺失的容器）。
++
++为什么单独一个文件
++------------------
++官方仓库**已经**把 EMA 的存取接线做完了：
++  * ``Checkpointer.save``：``state["ema"]`` 非 None 时写入 ``checkpoints/global_step_N/ema/``；
++  * ``AsyncHFCheckpointSaver``：``save_ema=True`` 时额外导出 ``ema_hf_ckpt/``；
++  * ``ckpt_to_state_dict(..., ema=True)`` 负责读回。
++但 ``tasks/vla/train_lingbotvla.py`` 与 ``train_pi0.py`` 里都只写了 ``"ema": None``，
++从未创建影子模型，所以整条通路是死的。本模块只补“容器 + 更新”这一块，
++**不改官方 ``lingbotvla/utils/ema.py``**（那个 ``ema_update`` 要求目标参数是 fp32，
++6.4B 参数即 25.5 GB 显存，不可用）。
++
++设计
++----
++* 影子参数逐层镜像主模型，**参数名与主模型完全一致**（不额外加前缀），因此官方的
++  DCP 存取与 HF 导出可以直接使用；
++* 影子参数用 bf16 保存（约 12.8 GB），主模型精度不变；
++* ``decay <= 0`` 时不创建对象，训练行为与改动前逐位一致；
++* 合规依据：赛题规则 2.3「训练期 EMA（产出仍为一份权重）」。EMA 不引入任何新的
++  监督信号，也零环境调用。
++
++关于 bf16 影子与随机舍入
++----------------------
++bf16 只有 8 位尾数，相对 ULP ≈ 0.39%、半 ULP ≈ 0.195%；而 ``decay=0.999`` 时单步
++更新量 ≈ ``1e-3·|src| ≈ 0.1%·|dst|`` **小于半 ULP**，直接用
++``dst.mul_(decay).add_(src, alpha=alpha)`` 会让两次舍入都把结果送回原值，影子权重被
++"冻结"在初始化值上且不报错。因此 ``update()`` 改为逐张量用 fp32 中间量计算 +
++随机舍入（stochastic rounding）写回 bf16，详见 :class:`EMAModel` docstring。
++
++用法（train_lingbotvla.py 内）
++-----------------------------
++    ema_model = None
++    if getattr(args.train, "ema_decay", 0.0) > 0:
++        ema_model = EMAModel(model, decay=args.train.ema_decay)
++    ...
++    state = {"model": model, "ema": ema_model, "optimizer": optimizer, "extra_state": {...}}
++    ...
++    optimizer.step()
++    if ema_model is not None:
++        ema_model.update(model)
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Dict, List, Optional
++
++import torch
++import torch.nn as nn
++
++__all__ = ["EMAModel"]
++
++logger = logging.getLogger(__name__)
++
++# 随机舍入 / 距离计算的分块元素数：避免为最大的单张量额外申请整块 fp32 临时量
++# （16M 元素 = 64 MB fp32），峰值额外显存只与分块大小有关，而不是 12.8 GB 级。
++_SR_CHUNK = 1 << 24
++
++
++def _local_view(t: torch.Tensor) -> torch.Tensor:
++    """DTensor → 本地分片张量（与 DTensor 共享存储）；普通张量原样返回。
++
++    FSDP2 下主模型参数是 DTensor，而 bit-view（``view(torch.int32)``）不在 DTensor 的
++    分片传播规则里，因此随机舍入统一在本地视图上做（单卡 1 rank 时本地视图就是全量）。
++    """
++    to_local = getattr(t, "to_local", None)
++    if callable(to_local) and hasattr(t, "device_mesh"):
++        return to_local()
++    return t
++
++
++def _stochastic_round_bf16_(dst: torch.Tensor, val: torch.Tensor, generator: Optional[torch.Generator] = None) -> None:
++    """把 fp32 值 ``val`` 以**随机舍入**写回 bf16 张量 ``dst``（原地）。
++
++    bf16 的位模式就是 fp32 的高 16 位，所以"舍入到 bf16"只取决于低 16 位是否进位：
++    给 fp32 位模式加上 ``U(0, 2^16)`` 的随机整数再截断低 16 位，即"以概率
++    ``low16 / 2^16`` 向上进位"，期望上无偏。低 16 位为 0 的值加随机数后若不跨过
++    2^16 边界则不进位，因此不动点不会被系统性打破；而 0.1% 量级的增量（低 16 位
++    ≈ 256）能以 ≈0.4% 的概率进位，期望增量正好等于原值。符号/量级由位模式本身保证
++    （符号位与阶码位于高 16 位，加法只影响尾数低位与少量进位）。
++
++    NaN/Inf 元素不做舍入，直接保留 ``dst`` 原值（跳过）。
++    """
++    dst = _local_view(dst)
++    val = _local_view(val)
++    if dst.shape != val.shape:
++        raise RuntimeError(
++            "EMA 随机舍入：影子与主模型的本地分片形状不一致（DTensor 布局不同），"
++            "无法安全原地写回；请把 ema_dtype 设为 float32 或关闭 EMA。"
++        )
++    if not dst.is_contiguous():
++        # 影子参数来自 clone，正常一定 contiguous；万一不是，reshape 会拿到副本
++        # 导致写入丢失（等于又一次"静默失效"），这里显式走临时张量
++        tmp = dst.contiguous()
++        _stochastic_round_bf16_(tmp, val, generator)
++        dst.copy_(tmp)
++        return
++    dst_flat = dst.reshape(-1)
++    val_flat = val.reshape(-1)
++    n = val_flat.numel()
++    for start in range(0, n, _SR_CHUNK):
++        end = min(start + _SR_CHUNK, n)
++        chunk = val_flat[start:end].contiguous()
++        # 用 int64 承载位模式，避免极大指数（bits 接近 0x7F7Fxxxx）时 int32 加法溢出
++        bits = chunk.view(torch.int32).to(torch.int64)
++        noise = torch.randint(0, 1 << 16, bits.shape, dtype=torch.int64, device=bits.device, generator=generator)
++        # & -65536 == 丢弃低 16 位，只保留 fp32 的高 16 位（即 bf16）
++        rounded = ((bits + noise) & -65536).to(torch.int32).view(torch.float32).to(torch.bfloat16)
++        finite = torch.isfinite(chunk)
++        dst_flat[start:end].copy_(torch.where(finite, rounded, dst_flat[start:end]))
++
++
++def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> Optional[float]:
++    """``||a - b||_2 / ||b||_2``；分块累加，本地形状不一致时返回 None。"""
++    a_flat = _local_view(a).detach().reshape(-1)
++    b_flat = _local_view(b).detach().reshape(-1)
++    if a_flat.numel() != b_flat.numel():
++        return None
++    num = 0.0
++    den = 0.0
++    n = a_flat.numel()
++    for start in range(0, n, _SR_CHUNK):
++        end = min(start + _SR_CHUNK, n)
++        x = a_flat[start:end].to(torch.float32)
++        y = b_flat[start:end].to(torch.float32)
++        num += float((x - y).pow(2).sum().item())
++        den += float(y.pow(2).sum().item())
++    return (num ** 0.5) / (den ** 0.5 + 1e-12)
++
++
++class EMAModel(nn.Module):
++    """与主模型同构的影子模块（bf16 影子参数）。
++
++    为什么必须随机舍入（stochastic rounding）
++    ----------------------------------------
++    bf16 尾数 8 位 ⇒ 相对 ULP ≈ 0.39%、半 ULP ≈ 0.195%；而 ``decay=0.999`` 时单步
++    增量 = ``(1-decay)·|src| ≈ 0.1%·|dst|`` **小于半 ULP** —— ``0.999·dst`` 舍入回
++    ``dst``、``+0.001·src`` 也舍入回 ``dst``，影子权重永远停在初始化值（整条 EMA
++    轨道变空操作，却不报错）。随机舍入以概率 ``low16/2^16`` 向上进位，使 0.1% 量级
++    的增量在期望上按比例累积，从而既保留 bf16 影子的显存优势又不冻结。
++
++    Args:
++        model: 主模型（可在 FSDP2 / DTensor 之下；单卡时语义等价于本地张量）。
++        decay: 滑动平均系数，推荐 0.999。
++        dtype: 影子参数精度，默认 bfloat16；``torch.float32`` 时跳过随机舍入、精确计算。
++        update_buffers: 浮点 buffer 是否也做 EMA；整型 buffer（如计数器）一律直拷。
++        log_interval: 每多少次 update 打印一次影子与主模型的相对距离（0 表示关闭）。
++    """
++
++    def __init__(
++        self,
++        model: nn.Module,
++        decay: float = 0.999,
++        dtype: torch.dtype = torch.bfloat16,
++        update_buffers: bool = True,
++        log_interval: int = 100,
++    ) -> None:
++        super().__init__()
++        if not (0.0 < decay < 1.0):
++            raise ValueError(f"ema decay 必须在 (0, 1) 区间内，收到 {decay}")
++        self.decay = float(decay)
++        self.ema_dtype = dtype
++        self.update_buffers_flag = bool(update_buffers)
++        self.log_interval = int(log_interval)
++        self.num_updates = 0
++        self._param_names: List[str] = []
++        self._buffer_names: List[str] = []
++
++        # ---------- 用 self 作为根，逐层镜像主模型的模块树 ----------
++        modules: Dict[str, nn.Module] = {"": self}
++        for name, _mod in model.named_modules():
++            if name == "":
++                continue
++            parent, _, leaf = name.rpartition(".")
++            child = nn.Module()
++            setattr(modules[parent], leaf, child)
++            modules[name] = child
++
++        for name, p in model.named_parameters():
++            parent, _, leaf = name.rpartition(".")
++            shadow = p.detach().to(dtype).clone()
++            modules[parent].register_parameter(leaf, nn.Parameter(shadow, requires_grad=False))
++            self._param_names.append(name)
++
++        for name, b in model.named_buffers():
++            parent, _, leaf = name.rpartition(".")
++            holder = modules[parent]
++            if leaf in dict(holder.named_parameters()) or leaf in dict(holder.named_buffers()):
++                continue
++            holder.register_buffer(leaf, b.detach().clone())
++            self._buffer_names.append(name)
++
++    # ------------------------------------------------------------------ #
++    @torch.no_grad()
++    def _ema_update_tensor_(self, dst: torch.Tensor, src: torch.Tensor, decay: float, alpha: float) -> None:
++        """单个张量的 EMA 更新：fp32 中间量计算，再按影子精度写回。"""
++        # new = decay·dst + alpha·src，全部在 fp32 里算（峰值额外显存 ≈ 2× 本张量；
++        # 随机舍入内部再按 64 MB 分块，不会为最大张量整块申请临时量）
++        new = dst.to(torch.float32).mul(decay).add_(src.to(torch.float32), alpha=alpha)
++        if dst.dtype == torch.bfloat16:
++            # bf16 写回必须随机舍入，否则 0.1% 量级的增量会被半 ULP 吞掉
++            _stochastic_round_bf16_(dst, new)
++        elif dst.dtype == torch.float32:
++            # fp32 影子：跳过随机舍入，直接精确写回
++            dst.copy_(new)
++        else:
++            # 其它低精度（本仓库未使用 ema_dtype=fp16 等）：常规就近舍入
++            dst.copy_(new.to(dst.dtype))
++
++    @torch.no_grad()
++    def update(self, model: nn.Module) -> None:
++        """在 ``optimizer.step()`` 之后调用一次。"""
++        decay = self.decay
++        alpha = 1.0 - decay
++        src_params = dict(model.named_parameters())
++        for name, dst in self.named_parameters():
++            src = src_params.get(name)
++            if src is None:
++                continue
++            self._ema_update_tensor_(dst, src.detach(), decay, alpha)
++
++        if self.update_buffers_flag:
++            src_bufs = dict(model.named_buffers())
++            for name, dst in self.named_buffers():
++                src = src_bufs.get(name)
++                if src is None:
++                    continue
++                src = src.detach()
++                if not torch.is_floating_point(dst):
++                    dst.copy_(src.to(dst.device))
++                    continue
++                self._ema_update_tensor_(dst, src, decay, alpha)
++
++        self.num_updates += 1
++        self._maybe_log(model)
++
++    @torch.no_grad()
++    def ema_distance(self, model: nn.Module, max_tensors: int = 8) -> float:
++        """抽样若干张量，返回 ``||ema - model||_2 / ||model||_2`` 的平均值。
++
++        可观测性入口（也供测试调用）：bf16 影子被舍入吞掉时该值恒为 0。
++        抽样按参数名等间距取，避免只看第一层（embedding）而误判整体。
++        """
++        src_params = dict(model.named_parameters())
++        dst_params = dict(self.named_parameters())
++        names = [n for n in self._param_names if n in src_params and n in dst_params]
++        if not names:
++            return 0.0
++        max_tensors = max(1, int(max_tensors))
++        if len(names) > max_tensors:
++            step = len(names) / max_tensors
++            names = [names[int(i * step)] for i in range(max_tensors)]
++        dists: List[float] = []
++        for name in names:
++            d = _rel_l2(dst_params[name], src_params[name])
++            if d is not None:
++                dists.append(d)
++        if not dists:
++            return 0.0
++        return sum(dists) / len(dists)
++
++    @torch.no_grad()
++    def _maybe_log(self, model: nn.Module) -> None:
++        """每 ``log_interval`` 次更新（以及第 1 次更新）打印一次相对距离。"""
++        if self.log_interval <= 0:
++            return
++        if self.num_updates != 1 and self.num_updates % self.log_interval != 0:
++            return
++        dist = self.ema_distance(model)
++        logger.info(
++            "[EMA] update=%d decay=%.4f dtype=%s rel_dist(ema vs model)=%.3e",
++            self.num_updates,
++            self.decay,
++            self.ema_dtype,
++            dist,
++        )
++        if dist == 0.0:
++            logger.warning(
++                "[EMA] 第 %d 次更新后 ||ema-model||/||model|| 仍为 0：EMA 未生效"
++                "（影子权重没跟上主模型，低精度写回可能又被舍入吞掉了）。",
++                self.num_updates,
++            )
++
++    @torch.no_grad()
++    def copy_to(self, model: nn.Module) -> None:
++        """把 EMA 权重写回主模型（仅调试/导出验证用；正式流程走 ``ema_hf_ckpt``）。"""
++        src_params = dict(self.named_parameters())
++        for name, dst in model.named_parameters():
++            src = src_params.get(name)
++            if src is not None:
++                dst.data.copy_(src.data.to(dst.dtype))
++
++    def extra_repr(self) -> str:
++        return (
++            f"decay={self.decay}, dtype={self.ema_dtype}, num_updates={self.num_updates}, "
++            f"params={len(self._param_names)}, buffers={len(self._buffer_names)}"
++        )
+--- a/tools/build_motion_weights.py
++++ b/tools/build_motion_weights.py
+@@ -0,0 +1,288 @@
++#!/usr/bin/env python3
++"""生成「低运动窗口降权」sidecar。
++
++思路
++----
++50 个任务 × 50 条 clean 轨迹里，有大量"几乎不动"的帧（抓稳之后的等待、任务完成后的
++静止、以及对齐前的微调）。这些帧占掉大量梯度权重，却教不出任何推进动作；实测评测侧
++4,611 个失败 episode **100% 是跑满 400 步超时**（不是早失败），说明模型学到了"待着不动"
++这个安全动作。本脚本按 release 数据**自身**的动作位移统计，给静止窗口降权。
++
++合规
++----
++* 训练全程零环境调用；
++* 权重只由 release 数据集的动作张量自身统计得到（不涉及成功率/奖励/评测结果）；
++* 属于赛题规则 2.1「按数据统计量重加权」；
++* 产出格式与 ``tools/build_adv_weights.py`` 完全一致，因此训练侧复用既有
++  ``--data.adv_weight_path`` 通路，**不需要改数据加载代码**。
++
++权重定义
++--------
++对第 e 条轨迹的动作序列 ``A ∈ R^{T×D}``：
++1. 逐维用全体数据的标准差 ``s_d`` 归一化（避免大量纲维度主导）；
++2. 逐帧位移 ``δ_t = mean_d |A[t+1,d] − A[t,d]| / s_d``（末帧复制前一帧）；
++3. 平滑 ``m_t = mean(δ_t … δ_{t+W−1})``，W = ``--window``（默认 10）；
++4. ``w_t = clamp((m_t / median(m)) ** 0.5, lo, hi)``（默认 lo=0.6, hi=1.0）；
++5. 全库归一化到 ``mean(w) = 1``（与 advantage 权重的归约口径一致，保持损失量级可比）。
++
++输出
++----
++**每个任务一份** sidecar：``<output-dir>/<data_name>.pt``，内容为
++``torch.save({"weights", "config", "episode_lengths", "num_samples"})``。
++逐任务输出是必须的：``VLADataset`` 会校验 sidecar 样本数 == 本任务样本数，
++而多任务训练会把同一份 config 传给每个任务的 dataset。
++``episode_lengths`` 让训练侧用 ``(episode_index, frame_index)`` 定位权重。
++
++用法
++----
++    python tools/build_motion_weights.py \
++        --data-root   /path/datasets/robotwin/lerobot \
++        --manifest    /path/datasets/robotwin/clean_training_data.txt \
++        --output-dir  /path/datasets/robotwin/motion_weights_clean50
++
++    # 训练：--data.adv_weight_path=/path/datasets/robotwin/motion_weights_clean50
++
++``--manifest`` 与训练的 ``data.train_path`` 必须是同一份清单（逐任务顺序一致）；
++脚本会按清单顺序拼接各任务的权重，并在写盘前断言总帧数一致。
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import os
++import sys
++from typing import List, Sequence, Tuple
++
++import numpy as np
++import torch
++
++
++# --------------------------------------------------------------------------- #
++# 读取
++# --------------------------------------------------------------------------- #
++def _read_episode_lengths(root: str) -> Tuple[List[int], dict]:
++    """读每个 episode 的帧数（v2.x episodes.jsonl 与 v3 episodes/*.parquet 都支持）。"""
++    meta_dir = os.path.join(root, "meta")
++    info = {}
++    info_path = os.path.join(meta_dir, "info.json")
++    if os.path.isfile(info_path):
++        with open(info_path, "r", encoding="utf-8") as f:
++            info = json.load(f)
++
++    lengths: List[int] = []
++    episodes_dir = os.path.join(meta_dir, "episodes")
++    if os.path.isdir(episodes_dir):
++        try:
++            import pyarrow.parquet as pq
++
++            files = sorted(glob.glob(os.path.join(episodes_dir, "**", "*.parquet"), recursive=True))
++            rows: List[Tuple[int, int]] = []
++            for fp in files:
++                table = pq.read_table(fp, columns=["episode_index", "length"])
++                rows.extend(zip(table.column("episode_index").to_pylist(),
++                                table.column("length").to_pylist()))
++            rows.sort(key=lambda r: r[0])
++            lengths = [int(r[1]) for r in rows]
++        except Exception:
++            lengths = []
++
++    if not lengths:
++        jsonl = os.path.join(meta_dir, "episodes.jsonl")
++        if os.path.isfile(jsonl):
++            rows = []
++            with open(jsonl, "r", encoding="utf-8") as f:
++                for line in f:
++                    line = line.strip()
++                    if line:
++                        rec = json.loads(line)
++                        rows.append((int(rec["episode_index"]), int(rec["length"])))
++            rows.sort(key=lambda r: r[0])
++            lengths = [r[1] for r in rows]
++
++    if not lengths:
++        raise FileNotFoundError(f"在 {meta_dir} 下找不到 episode 元数据")
++    return lengths, info
++
++
++def _read_actions(root: str, lengths: Sequence[int]) -> np.ndarray:
++    """按 episode 顺序读出动作，返回 (sum(lengths), D) 的 float32 数组。"""
++    import pyarrow.parquet as pq
++
++    files = sorted(glob.glob(os.path.join(root, "data", "**", "*.parquet"), recursive=True))
++    if not files:
++        raise FileNotFoundError(f"在 {root}/data 下找不到 parquet 文件")
++
++    chunks = []
++    for fp in files:
++        table = pq.read_table(fp, columns=["episode_index", "frame_index", "action"])
++        ep = np.asarray(table.column("episode_index").to_pylist(), dtype=np.int64)
++        fr = np.asarray(table.column("frame_index").to_pylist(), dtype=np.int64)
++        act = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
++        if act.ndim == 1:  # 单维动作
++            act = act[:, None]
++        chunks.append((ep, fr, act))
++
++    ep = np.concatenate([c[0] for c in chunks])
++    fr = np.concatenate([c[1] for c in chunks])
++    act = np.concatenate([c[2] for c in chunks], axis=0)
++
++    order = np.lexsort((fr, ep))
++    ep, fr, act = ep[order], fr[order], act[order]
++
++    # 校验：episode 连续、帧号从 0 连续递增、总帧数与 meta 一致
++    n_expected = int(sum(lengths))
++    if act.shape[0] != n_expected:
++        raise ValueError(
++            f"数据帧数 ({act.shape[0]}) 与 episode 长度之和 ({n_expected}) 不一致，"
++            "数据集可能不完整"
++        )
++    for e, ln in enumerate(lengths):
++        mask = ep == e
++        got = int(mask.sum())
++        if got != int(ln):
++            raise ValueError(f"episode {e} 帧数 {got} != meta 声明的 {ln}")
++        if got and (fr[mask].min() != 0 or fr[mask].max() != got - 1):
++            raise ValueError(f"episode {e} 的 frame_index 不是 0..{got-1} 连续")
++    return act
++
++
++# --------------------------------------------------------------------------- #
++# 权重
++# --------------------------------------------------------------------------- #
++def motion_weights(
++    actions: np.ndarray,
++    lengths: Sequence[int],
++    window: int = 10,
++    lo: float = 0.6,
++    hi: float = 1.0,
++    power: float = 0.5,
++    eps: float = 1e-6,
++) -> Tuple[np.ndarray, dict]:
++    a = actions.astype(np.float32, copy=False)
++    scale = a.std(axis=0)
++    scale = np.where(scale < eps, 1.0, scale).astype(np.float32)
++
++    delta = np.zeros(a.shape[0], dtype=np.float32)
++    off = 0
++    for ln in lengths:
++        seg = a[off: off + ln]
++        if ln >= 2:
++            d = np.abs(seg[1:] - seg[:-1]) / scale
++            d = d.mean(axis=1)
++            delta[off: off + ln - 1] = d
++            delta[off + ln - 1] = d[-1]
++        off += ln
++
++    # 窗口平滑（两端用 edge padding，避免尾部被压低）
++    if window > 1:
++        pad = window // 2
++        padded = np.pad(delta, (pad, window - 1 - pad), mode="edge")
++        kernel = np.ones(window, dtype=np.float32) / window
++        motion = np.convolve(padded, kernel, mode="valid")
++    else:
++        motion = delta
++
++    ref = float(np.median(motion)) if motion.size else 1.0
++    ref = max(ref, eps)
++    w = np.power(motion / ref, power)
++    w = np.clip(w, lo, hi).astype(np.float32)
++    mean_pre = float(w.mean())
++    w = w / max(mean_pre, eps)  # 归一化到 mean(w)=1（与 advantage 权重同口径）
++
++    stats = {
++        "kind": "motion_window_downweight",
++        "window": window,
++        "clip": [lo, hi],
++        "power": power,
++        "motion_median": ref,
++        "frac_at_lo": float((w <= (lo / max(mean_pre, eps)) * 1.001).mean()),
++        "mean_pre_norm": mean_pre,
++        "mean_after_norm": float(w.mean()),
++        "num_samples": int(w.size),
++    }
++    return w, stats
++
++
++def _iter_manifest(path: str) -> List[Tuple[str, str]]:
++    out = []
++    with open(path, "r", encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            if not line:
++                continue
++            parts = line.split()
++            if len(parts) < 2:
++                raise ValueError(f"清单行格式异常（需要 '<data_name> <repo_path>'）：{line!r}")
++            out.append((parts[0], parts[1]))
++    return out
++
++
++def main(argv=None) -> int:
++    p = argparse.ArgumentParser(description="生成低运动窗口降权 sidecar（每任务一份）")
++    p.add_argument("--data-root", required=True,
++                   help="LeRobot 数据集根目录；若 --manifest 里是绝对路径则忽略此项")
++    p.add_argument("--manifest", required=True,
++                   help="与训练 data.train_path 完全一致的清单（只有 data_name 顺序需要一致）")
++    p.add_argument("--output-dir", required=True,
++                   help="输出目录；会为每个任务写 <data_name>.pt（多任务训练必须用目录）")
++    p.add_argument("--window", type=int, default=10)
++    p.add_argument("--lo", type=float, default=0.6)
++    p.add_argument("--hi", type=float, default=1.0)
++    p.add_argument("--power", type=float, default=0.5)
++    p.add_argument("--dry-run", action="store_true", help="只打印统计，不写盘")
++    args = p.parse_args(argv)
++
++    entries = _iter_manifest(args.manifest)
++    print(f"[motion] 清单任务数: {len(entries)}")
++
++    per_task = {}
++    summary = []
++    for i, (name, rel) in enumerate(entries):
++        root = rel if os.path.isabs(rel) else os.path.join(args.data_root, rel)
++        if not os.path.isdir(root):
++            print(f"[motion] 跳过（目录不存在）：{root}", file=sys.stderr)
++            return 2
++        lengths, _info = _read_episode_lengths(root)
++        actions = _read_actions(root, lengths)
++        w, stats = motion_weights(actions, lengths, window=args.window,
++                                  lo=args.lo, hi=args.hi, power=args.power)
++        payload = {
++            "weights": torch.from_numpy(w.astype(np.float32)),
++            "config": {
++                "kind": "motion_window_downweight",
++                "data_name": name,
++                "window": args.window,
++                "clip": [args.lo, args.hi],
++                "power": args.power,
++                "manifest": os.path.abspath(args.manifest),
++                **stats,
++            },
++            "episode_lengths": [int(x) for x in lengths],
++            "num_samples": int(w.size),
++        }
++        per_task[name] = stats
++        out_path = os.path.join(args.output_dir, f"{name}.pt")
++        if not args.dry_run:
++            os.makedirs(args.output_dir, exist_ok=True)
++            torch.save(payload, out_path)
++        summary.append((name, w.size, float(w.mean()), stats["frac_at_lo"]))
++        print(f"  [{i+1:2d}/{len(entries)}] {name:28s} episodes={len(lengths):3d} "
++              f"frames={w.size:6d} 静止占比={stats['frac_at_lo']*100:5.1f}% "
++              f"mean={w.mean():.4f}")
++
++    total = sum(s[1] for s in summary)
++    print(f"[motion] 任务数 {len(summary)}，样本合计 {total}")
++    if args.dry_run:
++        print("[motion] dry-run，未写盘")
++        return 0
++    print(f"[motion] 已写出 {len(summary)} 份 sidecar 到：{args.output_dir}")
++    print("[motion] 训练时传 --data.adv_weight_path=<该目录>（目录形式，按 <data_name>.pt 逐任务匹配）")
++
++    print("[motion] 注意 yaml 里不要写 null（会被解析成字符串 'null' 导致找文件崩溃）")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- a/tools/export_hf_from_dcp.py
++++ b/tools/export_hf_from_dcp.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++"""从 DCP checkpoint 导出 HuggingFace 权重（可选导出 EMA 分支）。
++
++为什么需要它
++------------
++stage-1 的每一次 DCP 保存都会顺带导出 `hf_ckpt/`（25.5 GB，fp32）。stage-2 如果
++每 2000 步保存一次，同时导出 `hf_ckpt` + `ema_hf_ckpt`，磁盘占用会到 600 GB 量级。
++因此 stage-2 默认**只存 DCP**（`--train.save_hf_weights=false`），训练结束后用本脚本
++按需把「某个 step 的普通权重 / EMA 权重」导出成可评测的 hf_ckpt。
++
++它走的是官方同一条通路（`ckpt_to_state_dict` + `save_model_weights`），不引入新的
++权重格式。
++
++用法
++----
++    # 导出第 24000 步的普通权重
++    python tools/export_hf_from_dcp.py \
++        --dcp /out/checkpoints/global_step_24000 \
++        --assets-from /models/lingbot_hf_45000/hf_ckpt \
++        --out /out/hf/step_24000_plain
++
++    # 导出同一步的 EMA 权重
++    python tools/export_hf_from_dcp.py \
++        --dcp /out/checkpoints/global_step_24000 --ema \
++        --assets-from /models/lingbot_hf_45000/hf_ckpt \
++        --out /out/hf/step_24000_ema
++
++`--assets-from` 指向任意一份已有的 hf_ckpt（含 config.json / tokenizer 等），
++本脚本只替换里面的权重分片，其余文件原样拷贝。
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import os
++import shutil
++import sys
++
++import torch
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from lingbotvla.checkpoint.format_utils import ckpt_to_state_dict  # noqa: E402
++from lingbotvla.models.module_utils import save_model_weights  # noqa: E402
++
++NON_WEIGHT_PATTERNS = (
++    "*.json",
++    "*.txt",
++    "*.model",
++    "*.py",
++    "*.jinja",
++    "*.tiktoken",
++)
++
++
++def main(argv=None) -> int:
++    p = argparse.ArgumentParser(description="导出 DCP（可选 EMA）为 hf_ckpt")
++    p.add_argument("--dcp", required=True, help="checkpoints/global_step_N 目录")
++    p.add_argument("--out", required=True, help="输出 hf_ckpt 目录（不得已存在）")
++    p.add_argument("--assets-from", required=True, help="已有 hf_ckpt 目录，用于拷贝 config/tokenizer")
++    p.add_argument("--ema", action="store_true", help="导出 ema/ 分支（需训练时开了 EMA）")
++    p.add_argument("--ckpt-manager", default="dcp", choices=["dcp", "bytecheckpoint", "native"])
++    p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"],
++                   help="导出精度；官方提交用 F32（≈25.5 GB）")
++    p.add_argument("--shard-size", type=int, default=5_000_000_000)
++    args = p.parse_args(argv)
++
++    if os.path.exists(args.out):
++        print(f"输出目录已存在，拒绝覆盖：{args.out}", file=sys.stderr)
++        return 2
++    if args.ema:
++        ema_dir = os.path.join(args.dcp, "ema")
++        if not os.path.isdir(ema_dir):
++            print(f"未找到 EMA 分支：{ema_dir}\n"
++                  f"（训练时未开 --train.ema_decay，或该 step 保存时 EMA 尚未创建）",
++                  file=sys.stderr)
++            return 3
++
++    tmp = args.out + ".tmp"
++    if os.path.exists(tmp):
++        shutil.rmtree(tmp)
++    os.makedirs(tmp, exist_ok=True)
++
++    print(f"[export] DCP={args.dcp} ema={args.ema} dtype={args.dtype}")
++    state_dict = ckpt_to_state_dict(
++        save_checkpoint_path=args.dcp,
++        output_dir=tmp,
++        ckpt_manager=args.ckpt_manager,
++        ema=args.ema,
++    )
++    print(f"[export] 取到 {len(state_dict)} 个张量")
++
++    save_model_weights(
++        tmp,
++        state_dict,
++        save_dtype=getattr(torch, args.dtype),
++        shard_size=args.shard_size,
++    )
++    del state_dict
++
++    # 拷贝 config / tokenizer 等非权重文件
++    n_copied = 0
++    for pattern in NON_WEIGHT_PATTERNS:
++        for src in glob.glob(os.path.join(args.assets_from, pattern)):
++            dst = os.path.join(tmp, os.path.basename(src))
++            if os.path.isfile(src) and not os.path.exists(dst):
++                shutil.copy2(src, dst)
++                n_copied += 1
++    print(f"[export] 拷贝非权重文件 {n_copied} 个")
++
++    os.replace(tmp, args.out)
++    total = sum(os.path.getsize(f) for f in glob.glob(os.path.join(args.out, "*.safetensors")))
++    n_shard = len(glob.glob(os.path.join(args.out, "*.safetensors")))
++    print(f"[export] 完成：{args.out}（{n_shard} 分片，{total/1e9:.2f} GB）")
++    print("[export] 下次启动 deploy 前先跑 verify_hf_ckpt.sh 做静态校验")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- a/scripts/calibrate.py
++++ b/scripts/calibrate.py
+@@ -0,0 +1,241 @@
++#!/usr/bin/env python3
++"""配对评测汇总 / 选型比较。
++
++用途
++----
++1. checkpoint 选型：EMA 权重 vs 普通权重 vs 中间 step，谁更适合"提交"；
++2. DVAC 标定：baseline(use_length=50) vs use_length=25 vs DVAC(α=1.0)。
++
++判定口径（与官方评分一致）
++--------------------------
++每个 setting 各 5000 episode，最终分数 = (clean2clean 成功率 + clean2random
++成功率) / 2。因此比较两个 run 时同样取两个 setting 的等权平均；显著性用
++**逐任务配对差** 的 t 统计量（配对比独立样本量级更省 episode），并给符号检验。
++
++用法
++----
++    python scripts/calibrate.py \
++        --run A=/path/to/eval_run_A \
++        --run B=/path/to/eval_run_B \
++        [--run C=...] [--json report.json] [--threshold 2.0]
++
++目录要求：每条 episode 的 `jobs/**/outcome.json`（本队 eval_parallel 的产物）。
++也支持直接给 `reports/counts_*.json`（此时没有 episode 级配对，只做任务级配对）。
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import math
++import os
++from collections import defaultdict
++from typing import Dict, List, Tuple
++
++SETTINGS = ("clean2clean", "clean2random")
++# 单侧 95% 分位：标定只有 15 任务 × 2 setting = 30 个配对单元（df=29）→ t=1.699。
++# 30 单元、每单元 5 eps 时 SE≈1.8 pt，只看均值会把 +2 pt 的噪声当成胜出，
++# 因此判定必须用下限 LB = mean − 1.70×SE（等价要求 mean≥3.1 pt）。
++T95 = 1.70
++
++
++def load_run(path: str) -> Dict[Tuple[str, str, int], int]:
++    """返回 {(setting, task, seed): success}。"""
++    out: Dict[Tuple[str, str, int], int] = {}
++    for fp in glob.glob(os.path.join(path, "jobs", "**", "outcome.json"), recursive=True):
++        try:
++            rec = json.load(open(fp, encoding="utf-8"))
++        except Exception:
++            continue
++        job = rec.get("job") or {}
++        res = rec.get("result") or {}
++        setting = job.get("setting")
++        task = job.get("task")
++        eps = res.get("episodes") or []
++        if not setting or not task or not eps:
++            continue
++        for e in eps:
++            seed = e.get("seed")
++            if seed is None:
++                continue
++            out[(setting, str(task), int(seed))] = int(bool(e.get("success")))
++    return out
++
++
++def load_counts(path: str) -> Dict[Tuple[str, str], Tuple[int, int]]:
++    """从 counts_*.json 读 (successes, tests)，键为 (setting, task)。"""
++    for fp in [path] + glob.glob(os.path.join(path, "**", "counts_*.json"), recursive=True):
++        if not os.path.isfile(fp):
++            continue
++        d = json.load(open(fp, encoding="utf-8"))
++        recs = d.get("records") or []
++        out = {}
++        for r in recs:
++            setting, task = r.get("setting"), r.get("task")
++            if not setting or not task:
++                continue
++            out[(str(setting), str(task))] = (int(r.get("successes", 0)), int(r.get("tests", 0)))
++        if out:
++            return out
++    raise FileNotFoundError(f"没在 {path} 找到可用的评测结果")
++
++
++def summarize(ep: Dict[Tuple[str, str, int], int]) -> Dict[str, dict]:
++    per = {}
++    for setting in SETTINGS:
++        tasks = defaultdict(lambda: [0, 0])
++        for (s, t, _seed), ok in ep.items():
++            if s != setting:
++                continue
++            tasks[t][0] += ok
++            tasks[t][1] += 1
++        total_ok = sum(v[0] for v in tasks.values())
++        total_n = sum(v[1] for v in tasks.values())
++        per[setting] = {
++            "successes": total_ok,
++            "tests": total_n,
++            "rate": (total_ok / total_n * 100.0) if total_n else float("nan"),
++            "tasks": {k: {"successes": v[0], "tests": v[1]} for k, v in tasks.items()},
++        }
++    rates = [per[s]["rate"] for s in SETTINGS if not math.isnan(per[s]["rate"])]
++    per["mean"] = {"rate": sum(rates) / len(rates) if rates else float("nan")}
++    return per
++
++
++def paired_compare(a: Dict[Tuple[str, str, int], int], b: Dict[Tuple[str, str, int], int]):
++    """逐任务配对比较（同 setting 同任务内先各自算成功率，再求差）。"""
++    keys = set(a) & set(b)
++    if not keys:
++        return None
++    buckets = defaultdict(lambda: {"a": [0, 0], "b": [0, 0]})
++    for (setting, task, _seed) in keys:
++        buckets[(setting, task)]["a"][0] += a[(setting, task, _seed)]
++        buckets[(setting, task)]["a"][1] += 1
++        buckets[(setting, task)]["b"][0] += b[(setting, task, _seed)]
++        buckets[(setting, task)]["b"][1] += 1
++
++    diffs = []
++    rows = []
++    for (setting, task), v in sorted(buckets.items()):
++        ra = v["a"][0] / max(v["a"][1], 1) * 100.0
++        rb = v["b"][0] / max(v["b"][1], 1) * 100.0
++        diffs.append(rb - ra)
++        rows.append({"setting": setting, "task": task, "a": ra, "b": rb, "delta": rb - ra})
++
++    n = len(diffs)
++    mean_d = sum(diffs) / n
++    sd = math.sqrt(sum((d - mean_d) ** 2 for d in diffs) / max(n - 1, 1))
++    se = sd / math.sqrt(n) if n else float("inf")
++    pos = sum(1 for d in diffs if d > 0.5)
++    neg = sum(1 for d in diffs if d < -0.5)
++    return {
++        "paired_units": n,
++        "mean_delta_pt": mean_d,
++        "se_pt": se,
++        "t": (mean_d / se) if se > 0 else float("inf"),
++        "lb_pt": (mean_d - T95 * se) if se != float("inf") else float("-inf"),
++        "win_tasks": pos,
++        "lose_tasks": neg,
++        "tie_tasks": n - pos - neg,
++        "rows": rows,
++    }
++
++
++def load_any(path: str):
++    ep = load_run(path)
++    if ep:
++        return ep, True
++    return {}, False
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description="配对比较两个评测 run")
++    ap.add_argument("--run", action="append", required=True, metavar="NAME=DIR",
++                    help="可重复；第一个视为基线")
++    ap.add_argument("--json", default=None, help="把完整报告写成 JSON")
++    ap.add_argument("--threshold", type=float, default=1.0,
++                    help="实际意义门槛（pt）。主判据 = 单侧 95%% 下限 LB>0 且 mean_delta ≥ 该门槛")
++    args = ap.parse_args(argv)
++
++    runs: List[Tuple[str, str]] = []
++    for spec in args.run:
++        if "=" not in spec:
++            ap.error(f"--run 需要用 NAME=DIR 形式，收到 {spec!r}")
++        name, path = spec.split("=", 1)
++        runs.append((name, path))
++
++    episodes: Dict[str, Dict[Tuple[str, str, int], int]] = {}
++    counts_only: Dict[str, Dict[Tuple[str, str], Tuple[int, int]]] = {}
++    for name, path in runs:
++        ep, ok = load_any(path)
++        if ok:
++            episodes[name] = ep
++        else:
++            counts_only[name] = load_counts(path)
++            print(f"[warn] {name} 没有 episode 级 outcome.json，退化为任务级计数比较")
++
++    report = {"runs": {}, "comparisons": []}
++
++    print("=" * 78)
++    print(f"{'run':<28}{'clean2clean':>14}{'clean2random':>15}{'mean':>10}")
++    print("-" * 78)
++    for name, _ in runs:
++        if name in episodes:
++            s = summarize(episodes[name])
++            print(f"{name:<28}{s['clean2clean']['rate']:>13.2f}%{s['clean2random']['rate']:>14.2f}%{s['mean']['rate']:>9.2f}")
++            report["runs"][name] = {k: {kk: vv for kk, vv in v.items() if kk != "tasks"}
++                                    for k, v in s.items()}
++        else:
++            c = counts_only[name]
++            per = {}
++            for setting in SETTINGS:
++                ok = sum(v[0] for k, v in c.items() if k[0] == setting)
++                n = sum(v[1] for k, v in c.items() if k[0] == setting)
++                per[setting] = (ok, n, ok / max(n, 1) * 100.0)
++            mean = sum(per[s][2] for s in SETTINGS) / len(SETTINGS)
++            print(f"{name:<28}{per['clean2clean'][2]:>13.2f}%{per['clean2random'][2]:>14.2f}%{mean:>9.2f}")
++            report["runs"][name] = {"mean": {"rate": mean}}
++    print("=" * 78)
++
++    base_name = runs[0][0]
++    if base_name not in episodes:
++        print("基线没有 episode 级数据，跳过配对检验。")
++        return 0
++
++    for name, _ in runs[1:]:
++        if name not in episodes:
++            print(f"\n[{name}] 无 episode 级数据，跳过配对检验。")
++            continue
++        cmp_ = paired_compare(episodes[base_name], episodes[name])
++        if cmp_ is None:
++            print(f"\n[{name}] 与基线没有共同 episode（seed/任务不一致），无法配对。")
++            continue
++        lb = cmp_["lb_pt"]
++        if lb > 0 and cmp_["mean_delta_pt"] >= args.threshold:
++            verdict = "胜出"
++        elif cmp_["mean_delta_pt"] <= -args.threshold:
++            verdict = "失败"
++        else:
++            verdict = "无显著差异"
++        print(f"\n[{base_name} → {name}]  配对单元 {cmp_['paired_units']}（setting×task）")
++        print(f"  平均提升 {cmp_['mean_delta_pt']:+.2f} pt  (SE {cmp_['se_pt']:.2f}, t={cmp_['t']:.2f})")
++        print(f"  单侧 95% 下限 LB {lb:+.2f} pt  (= mean − {T95:.2f}×SE；单元越少越保守)")
++        print(f"  任务胜负 {cmp_['win_tasks']} 胜 / {cmp_['lose_tasks']} 负 / {cmp_['tie_tasks']} 平"
++              f"（仅展示：单任务分辨率 = 100/每任务 eps 数 pt，5 eps 时为 20 pt，不构成判据）")
++        print(f"  判定：{verdict}（主判据 LB>0 且 mean ≥ {args.threshold} pt）")
++        worst = sorted(cmp_["rows"], key=lambda r: r["delta"])[:5]
++        best = sorted(cmp_["rows"], key=lambda r: -r["delta"])[:5]
++        print("  掉点最多：" + ", ".join(f"{r['setting']}/{r['task']} {r['delta']:+.0f}" for r in worst))
++        print("  涨点最多：" + ", ".join(f"{r['setting']}/{r['task']} {r['delta']:+.0f}" for r in best))
++        report["comparisons"].append({"base": base_name, "cand": name, "verdict": verdict, **cmp_})
++
++    if args.json:
++        with open(args.json, "w", encoding="utf-8") as f:
++            json.dump(report, f, ensure_ascii=False, indent=2)
++        print(f"\n报告已写出：{args.json}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- a/scripts/train_stage2.sh
++++ b/scripts/train_stage2.sh
+@@ -0,0 +1,174 @@
++#!/usr/bin/env bash
++# ============================================================================
++# 灵波具身大模型挑战赛 · Stage-2 续训（终局冲刺）
++#
++# 起点 : 已提交权重 global_step_45000/hf_ckpt（F32，53.90%）
++# 目标 : 在同一份 release 数据上做第二轮训练，提升 clean2random（34.84%）并整体提分
++#
++# 与 stage-1 的差别（每一项都有明确依据，见 灵波挑战赛_终局冲刺方案.md）：
++#   1. 任务均衡采样        data.task_balanced=true
++#   2. 增广扩到五轴近似    data.image_augment=true + LINGBOT_AUG_CFG（代码内默认已开）
++#   3. 低运动窗口降权      data.adv_weight_path=<motion_weights 目录>
++#   4. 训练期 EMA          train.ema_decay=0.999（官方 DCP/HF 通路自动导出 ema_hf_ckpt）
++#   5. 温和重启 lr 2e-5 → 2e-6 cosine，batch 32 → 64
++#   6. 步数不写死：4.44 s/step 是 batch 32 的实测，batch 64 下约 8.9–10.7 s/step，
++#      34 h 窗口内 MAX_STEPS 由吞吐探针反算（公式见方案 §3），预期落在 10,000 步
++#      = 0.64M 样本 = stage-1（1.44M）的 44%；数据集 ≈ 496K 帧，累计 ≈ 4.2 epoch。
++#      下面 MAX_STEPS 的默认值 25000 只是上限，起跑前必须用探针结果覆盖。
++#
++# 路径配置（换机必读）：
++#   本脚本覆盖 model_path / train_path / output_dir / tokenizer_path / robot_config_root，
++#   并在启动前把 4 个教师权重路径写进 yaml。官方参数解析器只支持整块替换 align_params，
++#   不支持点路径覆盖，所以这里直接改文件而不是传命令行：
++#     MOGE_PATH        -> align_params.depth.moge_path
++#     MORGBD_PATH      -> align_params.depth.morgbd_path
++#     DINO_VIDEO_CKPT  -> align_params.video.ckpt_path
++#     DINO_VIDEO_CFG   -> align_params.video.config_path
++#   四个缺一不可：align_params 非空时训练会 from_pretrained 它们，占位符 /path/to 会在加载时报错。
++#   robot_config_root 由 ROBOT_CONFIG_ROOT 覆盖，默认指向仓库内 configs/robot_configs。
++#
++# 磁盘策略：默认只存 DCP（save_hf_weights=false）。训练结束或中途需要评测时，
++# 用 tools/export_hf_from_dcp.py 按需导出 plain / EMA 权重为 hf_ckpt。
++#
++# 用法：
++#   BASE_HF_CKPT=/path/global_step_45000/hf_ckpt \
++#   DATA_MANIFEST=/path/clean_training_data.txt \
++#   TOKENIZER_PATH=/path/Qwen3-VL-4B-Instruct \
++#   MOGE_PATH=/path/moge2-vitb-normal.pt \
++#   MORGBD_PATH=/path/depth/model.pt \
++#   DINO_VIDEO_CKPT=/path/dino_video/teacher_step_10000.pth \
++#   DINO_VIDEO_CFG=/path/dino_video/config.yaml \
++#   ROBOT_CONFIG_ROOT=/path/robot_configs \
++#   MOTION_WEIGHTS=/path/motion_weights_clean50 \
++#   OUT_DIR=/out/stage2  bash scripts/train_stage2.sh
++#   （MOTION_WEIGHTS 是**目录**，目录内含 <data_name>.pt）
++# ============================================================================
++set -euo pipefail
++
++V2_ROOT=${V2_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
++TRAIN_ENV=${TRAIN_ENV:-$V2_ROOT/../../miniconda3/envs/lingbotvla}
++OUT_DIR=${OUT_DIR:?需要设置 OUT_DIR（训练输出目录，不得已存在）}
++LOG_DIR=${LOG_DIR:-${OUT_DIR}.logs}
++BASE_HF_CKPT=${BASE_HF_CKPT:?需要设置 BASE_HF_CKPT（stage-1 的 hf_ckpt 目录）}
++DATA_MANIFEST=${DATA_MANIFEST:-}
++TOKENIZER_PATH=${TOKENIZER_PATH:-}   # 可选；非空时覆盖 model.tokenizer_path（换机必填）
++ROBOT_CONFIG_ROOT=${ROBOT_CONFIG_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/configs/robot_configs}
++MOGE_PATH=${MOGE_PATH:?需要设置 MOGE_PATH（moge2-vitb-normal.pt）}
++MORGBD_PATH=${MORGBD_PATH:?需要设置 MORGBD_PATH（LingBot-Depth 权重）}
++DINO_VIDEO_CKPT=${DINO_VIDEO_CKPT:?需要设置 DINO_VIDEO_CKPT（teacher_step_10000.pth）}
++DINO_VIDEO_CFG=${DINO_VIDEO_CFG:?需要设置 DINO_VIDEO_CFG（dino_video 的 config.yaml）}
++MOTION_WEIGHTS=${MOTION_WEIGHTS:-}   # 目录，内含 <data_name>.pt；见 tools/build_motion_weights.py
++
++MAX_STEPS=${MAX_STEPS:-25000}
++# 5000 而非 2500：单份 DCP ≈63.8 GB（fp32 模型 25.5 + EMA bf16 12.75 + Muon 动量 fp32 25.5），
++# 2500 步要存 10 份 ≈638 GB，超出现有磁盘预算；5000 步存 5 份 ≈319 GB，且 20k 仍在保存点上。
++SAVE_STEPS=${SAVE_STEPS:-5000}
++# 显存不足时的降级阶梯（**保持全局 batch = 64**，只换组合）：
++#   8 × 8（默认） → 4 × 16 → 2 × 32
++# 不要用 6 × 10 这类组合：那会把有效 batch 改成 60，等于改了训练配方。
++MICRO_BS=${MICRO_BS:-8}
++GA=${GA:-8}
++GLOBAL_BS=${GLOBAL_BS:-$((MICRO_BS * GA))}
++LR=${LR:-2e-5}
++LR_MIN=${LR_MIN:-2e-6}
++EMA_DECAY=${EMA_DECAY:-0.999}
++SAVE_HF=${SAVE_HF:-false}
++
++cd "$V2_ROOT"
++
++if [ -e "$OUT_DIR" ]; then
++  echo "[stage2] 输出目录已存在，拒绝启动以免覆盖：$OUT_DIR" >&2
++  exit 2
++fi
++if [ ! -d "$BASE_HF_CKPT" ]; then
++  echo "[stage2] BASE_HF_CKPT 不存在：$BASE_HF_CKPT" >&2
++  exit 2
++fi
++missing=0
++for f in "$MOGE_PATH" "$MORGBD_PATH" "$DINO_VIDEO_CKPT" "$DINO_VIDEO_CFG"; do
++  if [ ! -f "$f" ]; then echo "[stage2] 教师权重不存在：$f" >&2; missing=1; fi
++done
++if [ "$missing" = 1 ]; then
++  echo "[stage2] 四个教师权重缺一不可（来源见 REQUIREMENTS.md），拒绝启动" >&2
++  exit 2
++fi
++BASE_YAML=${BASE_YAML:-configs/vla/robotwin/robotwin.yaml}
++# 官方解析器无法按点路径覆盖 align_params，启动前把 4 个路径写进 yaml 副本再训练
++RUN_YAML="$LOG_DIR/robotwin.run.yaml"
++mkdir -p "$LOG_DIR"
++python3 - "$V2_ROOT/$BASE_YAML" "$RUN_YAML" "$MOGE_PATH" "$MORGBD_PATH" "$DINO_VIDEO_CKPT" "$DINO_VIDEO_CFG" <<'PY'
++import sys, yaml
++src, dst, moge, morgbd, ckpt, cfg = sys.argv[1:]
++doc = yaml.safe_load(open(src, encoding="utf-8"))
++depth, video = doc["train"]["align_params"]["depth"], doc["train"]["align_params"]["video"]
++depth["moge_path"], depth["morgbd_path"] = moge, morgbd
++video["ckpt_path"], video["config_path"] = ckpt, cfg
++yaml.safe_dump(doc, open(dst, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
++PY
++echo "[stage2] 已写入教师权重路径 -> $RUN_YAML"
++mkdir -p "$OUT_DIR"
++
++export PATH="$TRAIN_ENV/bin:$PATH"
++export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
++export MASTER_ADDR=127.0.0.1
++export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
++export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
++export TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
++export HF_HUB_DISABLE_TELEMETRY=1 DISABLE_TELEMETRY=1
++
++EXTRA=()
++if [ -n "$DATA_MANIFEST" ]; then EXTRA+=("--data.train_path=$DATA_MANIFEST"); fi
++if [ -n "$TOKENIZER_PATH" ]; then EXTRA+=("--model.tokenizer_path=$TOKENIZER_PATH"); fi
++if [ -n "$ROBOT_CONFIG_ROOT" ]; then EXTRA+=("--data.robot_config_root=$ROBOT_CONFIG_ROOT"); fi
++if [ -n "$MOTION_WEIGHTS" ]; then
++  EXTRA+=("--data.adv_weight_path=$MOTION_WEIGHTS")
++else
++  echo "[stage2] 警告：未提供 MOTION_WEIGHTS（应为目录），低运动降权不会生效（其余项照常）"
++fi
++
++echo "================ stage-2 配置 ================"
++echo "BASE_HF_CKPT  = $BASE_HF_CKPT"
++echo "OUT_DIR       = $OUT_DIR"
++echo "MAX_STEPS     = $MAX_STEPS   SAVE_STEPS = $SAVE_STEPS"
++echo "batch         = $MICRO_BS x $GA = $GLOBAL_BS"
++echo "lr            = $LR -> $LR_MIN (cosine)"
++echo "ema_decay     = $EMA_DECAY   save_hf_weights = $SAVE_HF"
++echo "tokenizer     = ${TOKENIZER_PATH:-<yaml 里的占位符>}"
++echo "motion weights= ${MOTION_WEIGHTS:-<none>}  (目录形式)"
++echo "=============================================="
++
++set +e
++torchrun --standalone --nnodes=1 --nproc-per-node=1 \
++  tasks/vla/train_lingbotvla.py "$RUN_YAML" \
++  --model.model_path="$BASE_HF_CKPT" \
++  --train.output_dir="$OUT_DIR" \
++  --train.max_steps="$MAX_STEPS" \
++  --train.save_steps="$SAVE_STEPS" --train.save_epochs=0 \
++  --train.micro_batch_size="$MICRO_BS" \
++  --train.gradient_accumulation_steps="$GA" \
++  --train.global_batch_size="$GLOBAL_BS" \
++  --train.lr="$LR" --train.lr_min="$LR_MIN" \
++  --train.lr_decay_style=cosine --train.lr_warmup_ratio=0.01 \
++  --train.enable_gradient_checkpointing=true \
++  --train.enable_fp32=true \
++  --train.use_compile=true \
++  --train.ema_decay="$EMA_DECAY" --train.ema_dtype=bfloat16 \
++  --train.save_hf_weights="$SAVE_HF" \
++  --train.async_save_hf_weights=false \
++  --train.enable_resume=false \
++  --train.enable_profiling=false \
++  --data.image_augment=true \
++  --data.task_balanced=true \
++  --eval.enabled=false \
++  "${EXTRA[@]}" \
++  2>&1 | tee "$LOG_DIR/train.log"
++rc=${PIPESTATUS[0]}
++set -e
++
++printf 'exit_code=%s\n' "$rc" > "$LOG_DIR/status"
++echo "[stage2] torchrun exit_code=$rc；日志：$LOG_DIR/train.log；产物：$OUT_DIR"
++echo "[stage2] 导出可评测权重："
++echo "  python tools/export_hf_from_dcp.py --dcp $OUT_DIR/checkpoints/global_step_$MAX_STEPS \\"
++echo "      --assets-from $BASE_HF_CKPT --out <hf_dir>          # 普通权重"
++echo "  python tools/export_hf_from_dcp.py --ema ... （同上）    # EMA 权重"
++exit "$rc"
+--- a/tests/test_stage2_extra.py
++++ b/tests/test_stage2_extra.py
+@@ -0,0 +1,364 @@
++"""stage-2 / DVAC 新增件的单元测试（在训练环境里跑：pytest -q tests/test_stage2_extra.py）。
++
++这些测试**不需要数据集、不需要 GPU、不需要模型权重**，可在训练启动前 1 分钟内跑完。
++"""
++
++from __future__ import annotations
++
++import inspect
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn as nn
++
++
++# --------------------------------------------------------------------------- #
++# 1) 增广：形状/ dtype 不变、关闭时不改变像素、开启时不产生 NaN
++# --------------------------------------------------------------------------- #
++def test_aug_preserves_shape_and_dtype():
++    from lingbotvla.data.vla_data.transform import (
++        sample_visual_augmentation_params,
++        apply_visual_augmentation,
++    )
++
++    torch.manual_seed(0)
++    img = torch.rand(3, 224, 224)
++    for _ in range(20):
++        params = sample_visual_augmentation_params(img)
++        out = apply_visual_augmentation(img, params)
++        assert out.shape == img.shape
++        assert out.dtype == img.dtype
++        assert torch.isfinite(out).all()
++        assert out.min() >= 0.0 and out.max() <= 1.0
++
++    # 视频形态 (T,C,H,W) 也要支持
++    vid = torch.rand(2, 3, 224, 224)
++    params = sample_visual_augmentation_params(vid)
++    out = apply_visual_augmentation(vid, params)
++    assert out.shape == vid.shape
++
++
++def test_aug_identity_params_is_identity():
++    from lingbotvla.data.vla_data.transform import apply_visual_augmentation
++
++    img = torch.rand(3, 64, 64)
++    params = {
++        "brightness": torch.tensor(1.0),
++        "contrast": torch.tensor(1.0),
++        "saturation": torch.tensor(1.0),
++    }
++    out = apply_visual_augmentation(img, params)
++    assert torch.allclose(out, img, atol=1e-5)
++
++
++def test_aug_disable_geo_and_erase_via_env(monkeypatch):
++    from lingbotvla.data.vla_data import transform as T
++
++    monkeypatch.setitem(T.AUG_CFG, "p_geo", 0.0)
++    monkeypatch.setitem(T.AUG_CFG, "p_erase", 0.0)
++    monkeypatch.setitem(T.AUG_CFG, "p_noise", 0.0)
++    img = torch.rand(3, 64, 64)
++    for _ in range(10):
++        p = T.sample_visual_augmentation_params(img)
++        assert "geo" not in p and "erase" not in p and "noise_sigma" not in p
++
++
++# --------------------------------------------------------------------------- #
++# 2) 任务均衡采样：槽位 → 帧下标的映射
++# --------------------------------------------------------------------------- #
++def test_task_balanced_slot_mapping():
++    from lingbotvla.data.vla_data.multi_vla_dataset import MultiVLADataset
++
++    ds = object.__new__(MultiVLADataset)
++    ds.dataset_start_index = [0, 100, 100 + 500]     # 三个任务，帧数 100 / 500 / 50
++    ds._frames_per_task = [100, 500, 50]
++    ds._n_tasks = 3
++    ds.task_balanced = True
++
++    seen_tasks = [0, 0, 0]
++    for slot in range(3000):
++        idx = ds._slot_to_index(slot)
++        task = 0 if idx < 100 else (1 if idx < 600 else 2)
++        bound = ds.dataset_start_index[task], ds.dataset_start_index[task] + ds._frames_per_task[task]
++        assert bound[0] <= idx < bound[1], (slot, idx, task)
++        seen_tasks[task] += 1
++    # 每个任务拿到完全相同数量的槽位
++    assert seen_tasks == [1000, 1000, 1000], seen_tasks
++
++
++def test_task_balanced_disabled_is_identity():
++    from lingbotvla.data.vla_data.multi_vla_dataset import MultiVLADataset
++
++    ds = object.__new__(MultiVLADataset)
++    ds.dataset_start_index = [0, 100]
++    ds._frames_per_task = [100, 500]
++    ds._n_tasks = 2
++    ds.task_balanced = False
++    for slot in (0, 7, 123):
++        assert ds._slot_to_index(slot) == slot
++
++
++# --------------------------------------------------------------------------- #
++# 3) EMA：影子参数名与主模型完全一致、能收敛、state_dict 可往返
++# --------------------------------------------------------------------------- #
++class _Tiny(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.a = nn.Linear(4, 4)
++        self.block = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
++        self.register_buffer("step", torch.tensor(0, dtype=torch.long))
++
++    def forward(self, x):
++        return self.block(self.a(x))
++
++
++def test_ema_names_match_and_copies_buffers():
++    from lingbotvla.utils.ema_model import EMAModel
++
++    m = _Tiny()
++    ema = EMAModel(m, decay=0.9, dtype=torch.float32)
++    assert [n for n, _ in ema.named_parameters()] == [n for n, _ in m.named_parameters()]
++    assert [n for n, _ in ema.named_buffers()] == [n for n, _ in m.named_buffers()]
++    # 初始即等于主模型
++    for (n1, p1), (n2, p2) in zip(ema.named_parameters(), m.named_parameters()):
++        assert n1 == n2 and torch.allclose(p1, p2.to(p1.dtype))
++
++
++def test_ema_moves_towards_model_and_roundtrips():
++    from lingbotvla.utils.ema_model import EMAModel
++
++    torch.manual_seed(0)
++    m = _Tiny()
++    ema = EMAModel(m, decay=0.9, dtype=torch.float32)
++    before = {n: p.clone() for n, p in ema.named_parameters()}
++
++    with torch.no_grad():
++        for p in m.parameters():
++            p.add_(1.0)
++    for _ in range(30):
++        ema.update(m)
++
++    for n, p in ema.named_parameters():
++        assert torch.allclose(p, m.state_dict()[n], atol=1e-2), n
++        assert not torch.allclose(p, before[n]), n
++
++    sd = ema.state_dict()
++    ema2 = EMAModel(m, decay=0.9, dtype=torch.float32)
++    ema2.load_state_dict(sd)
++    for n, p in ema2.named_parameters():
++        assert torch.allclose(p, sd[n])
++
++
++def test_ema_rejects_bad_decay():
++    from lingbotvla.utils.ema_model import EMAModel
++
++    with pytest.raises(ValueError):
++        EMAModel(_Tiny(), decay=0.0)
++    with pytest.raises(ValueError):
++        EMAModel(_Tiny(), decay=1.0)
++
++
++def test_ema_bf16_shadow_is_not_frozen():
++    """bf16 影子 + decay=0.999：单步增量(0.1%) < 半 ULP(0.195%)。
++
++    只有随机舍入才能让增量在期望上累积；旧的 ``dst.mul_(decay).add_(src)``
++    会让影子权重永远等于初始化值（本用例会失败）。
++    """
++    from lingbotvla.utils.ema_model import EMAModel
++
++    torch.manual_seed(0)
++    m = _Tiny()
++    ema = EMAModel(m, decay=0.999, dtype=torch.bfloat16, log_interval=0)
++    before = {n: p.clone() for n, p in ema.named_parameters()}
++
++    with torch.no_grad():
++        for p in m.parameters():
++            p.add_(1.0)
++    for _ in range(500):
++        ema.update(m)
++
++    moved = {n: not torch.equal(p, before[n]) for n, p in ema.named_parameters()}
++    assert any(moved.values()), f"bf16 EMA 影子完全没动：{moved}"
++    # 500 步后应跟随 1 - 0.999**500 ≈ 39% 的位移，distance 因此明显大于 0
++    dist = ema.ema_distance(m)
++    assert 0.1 < dist < 1.0, dist
++
++
++# --------------------------------------------------------------------------- #
++# 4) DVAC：执行长度决策（τ 只用历史 chunk；冷启动不截断）
++# --------------------------------------------------------------------------- #
++class _FakeServer:
++    dvac_alpha = 1.0
++    dvac_n_min = 5
++    dvac_n_max = 50
++    dvac_min_history = 2
++    dvac_verbose = False
++    _dvac_buf_maxlen = 8
++
++    def __init__(self):
++        self._dvac_buf = []
++        self._dvac_trace = []
++
++
++def _call(server, var, max_len=50):
++    from deploy.lingbot_vla_v2_policy import LingbotVLAv2Server
++
++    return LingbotVLAv2Server._dvac_exec_len(server, var, max_len)
++
++
++def _chunk(value, length=50):
++    return torch.full((1, length), float(value), dtype=torch.float32)
++
++
++def _warmup(server, value=0.01):
++    """先喂满 dvac_min_history 个历史 chunk（冷启动段一律返回 max_len）。"""
++    for _ in range(server.dvac_min_history):
++        assert _call(server, _chunk(value)) == 50
++
++
++def test_dvac_cold_start_returns_full_chunk():
++    """历史不足 dvac_min_history 时不做截断，n = max_len（退回原版行为）。"""
++    s = _FakeServer()
++    # 第 1 个 chunk（历史为空）即便整段高方差，也不截断
++    assert _call(s, _chunk(100.0)) == 50
++    assert len(s._dvac_buf) == 1
++    # 第 2 个 chunk 时历史只有 1 个 (< dvac_min_history=2) → 仍然不截断
++    assert _call(s, _chunk(100.0)) == 50
++    assert len(s._dvac_buf) == 2
++
++    # 对照组：同样这段高方差 chunk，历史用低方差填满后就会被截断到 n_min
++    s2 = _FakeServer()
++    _warmup(s2, value=0.01)             # 历史 [0.01, 0.01] ⇒ τ=0.01
++    assert _call(s2, _chunk(100.0)) == s2.dvac_n_min
++
++
++def test_dvac_cuts_at_first_high_variance_index():
++    s = _FakeServer()
++    _warmup(s, value=0.01)              # 历史 μ≈0.01, σ=0 ⇒ τ=0.01
++    # 前 12 步方差低，其余高 → 第一个 V(k)>τ 在 k=12
++    v = torch.cat([torch.full((12,), 0.01), torch.full((38,), 10.0)]).unsqueeze(0)
++    n = _call(s, v)
++    assert 5 <= n <= 50
++    assert n == 12, n
++
++
++def test_dvac_all_low_takes_full_chunk():
++    s = _FakeServer()
++    _warmup(s, value=0.02)
++    # 与历史持平 → 不触发截断（等于 τ 也不算 >）
++    assert _call(s, _chunk(0.02)) == 50
++
++
++def test_dvac_respects_bounds():
++    s = _FakeServer()
++    _warmup(s)
++    v = torch.cat([torch.full((1,), 100.0), torch.zeros((1, 49))], dim=1)
++    assert _call(s, v) == s.dvac_n_min
++    s2 = _FakeServer()
++    s2.dvac_n_max = 20
++    _warmup(s2)
++    # 整段低于 τ → n = max_len = 50，再被 n_max 压到 20
++    assert _call(s2, torch.zeros(1, 50)) == 20
++
++
++def test_dvac_buffer_is_bounded():
++    s = _FakeServer()
++    for _ in range(50):
++        _call(s, _chunk(0.01))
++    assert len(s._dvac_buf) <= s._dvac_buf_maxlen
++    assert len(s._dvac_buf) == s._dvac_buf_maxlen
++
++
++def test_dvac_threshold_uses_history_only():
++    """τ 只用历史：当前 chunk 在算完 τ 之后才入缓冲区。
++
++    历史 = [0.01, 0.03] ⇒ μ=0.02, σ=0.01；α=1 ⇒ τ=0.03。
++    当前 chunk 恒为 0.035：0.035 > τ ⇒ 第 0 步即异常 ⇒ n = n_min = 5。
++    （旧实现先把 0.035 入缓冲区：μ=0.025、σ≈0.0108、τ≈0.0358 > 0.035 ⇒ n=50，
++      也就是"拿自己的均值当阈值"，这正是修复前的退化。）
++    """
++    s = _FakeServer()
++    s._dvac_buf = [0.01, 0.03]
++    assert _call(s, _chunk(0.035)) == s.dvac_n_min
++
++    # 同一份历史、同一段曲线：α 现在真的能改变判决（旧实现里 α 几乎无效）
++    s_a1 = _FakeServer()
++    s_a1._dvac_buf = [0.01, 0.03]
++    assert _call(s_a1, _chunk(0.025)) == 50        # τ=0.03，整段不超阈值
++    s_a0 = _FakeServer()
++    s_a0._dvac_buf = [0.01, 0.03]
++    s_a0.dvac_alpha = 0.0
++    assert _call(s_a0, _chunk(0.025)) == s_a0.dvac_n_min   # τ=0.02，第 0 步即截断
++
++
++def test_dvac_reset_clears_state(monkeypatch):
++    """reset() 必须清空跨 episode 的 DVAC 统计量，否则历史污染 τ。"""
++    import deploy.lingbot_vla_v2_policy as mod
++
++    class _DummyFT:
++        def __init__(self, *args, **kwargs):
++            self.org_features = {"actions": ["action"]}
++
++    class _DummyVLA:
++        feature_transform = None
++
++    monkeypatch.setattr(mod, "FeatureTransform", _DummyFT)
++
++    s = object.__new__(mod.LingbotVLAv2Server)
++    s.use_bf16 = True
++    s.use_length = 20
++    s.vla = _DummyVLA()
++    s.data_config = object()
++    s.config = SimpleNamespace(chunk_size=50)
++    s.processor = None
++    s.robot_norm_path = None
++    s.action_key = "action"
++    s.global_step = 123
++    s.last_action_chunk = {"action": torch.zeros(1, 20, 4)}
++    s.last_normalized_action_chunk = None
++    s._dvac_buf = [0.01, 0.02, 0.03]
++    s._dvac_trace = [(0.01, 0.02, 5)]
++    s._dvac_var = torch.zeros(1, 50)
++    s._exec_len = 7
++
++    s.reset(robo_name="robotwin")
++
++    assert s._dvac_buf == []
++    assert s._dvac_trace == []
++    assert s._dvac_var is None
++    assert s._exec_len == s.use_length == 20
++    assert s.global_step == 0
++
++
++def test_dvac_rejects_chunk_ret_false():
++    """dvac_alpha>0 + chunk_ret=False 会错位（_eff_len 被改写），必须直接报错。"""
++    from deploy.lingbot_vla_v2_policy import LingbotVLAv2Server
++
++    with pytest.raises(ValueError):
++        LingbotVLAv2Server(path_to_pi_model="", chunk_ret=False, dvac_alpha=1.0)
++
++
++# --------------------------------------------------------------------------- #
++# 5) 采样接口：DVAC 需要的那两个 kwarg 必须存在
++# --------------------------------------------------------------------------- #
++def test_sample_actions_has_dvac_kwargs():
++    from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import (
++        LingbotVlaV2Policy,
++    )
++
++    inner = [m for _, m in LingbotVlaV2Policy.__dict__.items()]
++    _ = inner  # policy 只是转发，真正的实现在内部 action expert
++    import lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 as mod
++
++    found = False
++    for name in dir(mod):
++        obj = getattr(mod, name)
++        fn = getattr(obj, "sample_actions", None)
++        if fn is not None and hasattr(fn, "__code__"):
++            code = fn.__code__
++            if "return_denoise_var" in code.co_varnames:
++                found = True
++                sig = inspect.signature(fn)
++                assert "denoise_var_tail_steps" in sig.parameters
++    assert found, "没有找到带 return_denoise_var 的 sample_actions 实现"

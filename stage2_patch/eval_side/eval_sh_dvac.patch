@@ -1,0 +1,29 @@
+--- a/eval.sh
++++ b/eval.sh
+@@ -19,6 +19,8 @@
+ die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ task= model= setting=both episodes=100 port=9330 output= check=0 health_timeout=600 video=False
++# DVAC: 默认空 → 与冻结行为逐位一致；启用示例：DVAC_ARGS="--dvac_alpha 1.0" ./eval.sh ...
++DVAC_ARGS=${DVAC_ARGS:-}
+ while (($#)); do
+   case "$1" in
+     --help) usage; exit 0 ;;
+@@ -48,7 +50,7 @@
+ SIM_PY="$ROOT/repos/RLinf/.venv/bin/python"
+ export QWEN3VL_PATH=${QWEN3VL_PATH:-$ROOT/models/qwen3vl}
+ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+-printf 'PLAN task=%s setting=%s episodes=%s port=%s FP32 compile=True chunk=50 num_steps=10 offline=1\n' "$task" "$setting" "$episodes" "$port"
++printf 'PLAN task=%s setting=%s episodes=%s port=%s FP32 compile=True chunk=50 num_steps=10 offline=1 dvac=%s\n' "$task" "$setting" "$episodes" "$port" "${DVAC_ARGS:-<off>}"
+ failed=0
+ for command in python3 nvidia-smi curl flock tee; do
+   if ! command -v "$command" >/dev/null; then printf 'BLOCKED: command missing: %s\n' "$command"; failed=1; fi
+@@ -181,7 +183,7 @@
+   cd "$V2"
+   exec "$INFER_PY" -u deploy/lingbot_vla_v2_policy.py \
+     --model_path "$model" --port "$port" --use_length 50 --chunk_ret True \
+-    --use_bf16 False --use_fp32 True --use_compile True
++    --use_bf16 False --use_fp32 True --use_compile True ${DVAC_ARGS}
+ ) >"$output/server.log" 2>&1 &
+ server_pid=$!
+ deadline=$((SECONDS + health_timeout))
