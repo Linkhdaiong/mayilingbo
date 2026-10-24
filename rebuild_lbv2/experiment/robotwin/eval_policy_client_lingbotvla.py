@@ -17,6 +17,7 @@ import yaml
 from datetime import datetime
 import importlib
 import argparse
+import ast
 import pdb
 
 from generate_episode_instructions import *
@@ -210,7 +211,8 @@ def eval_policy(task_name,
                 video_fps="10",
                 instruction_type=None,
                 usr_args = None):
-    print(f"\033[34mTask Name: {args['task_name']}\033[0m")
+    task_name = args["task_name"]
+    print(f"\033[34mTask Name: {task_name}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
     expert_check = True
@@ -344,6 +346,8 @@ def eval_policy(task_name,
             if len(action.shape) == 2:
                 initial_obs = False
                 for act in action:
+                    if TASK_ENV.take_action_cnt >= TASK_ENV.step_lim:
+                        break
                     if initial_obs: # ensure the video is correct, but slow down simulation
                         # observation = TASK_ENV.get_obs()
                         pass
@@ -413,13 +417,15 @@ def parse_args_and_config():
 
     # Parse overrides
     def parse_override_pairs(pairs):
+        if len(pairs) % 2:
+            parser.error("--overrides requires key/value pairs")
         override_dict = {}
         for i in range(0, len(pairs), 2):
             key = pairs[i].lstrip("--")
             value = pairs[i + 1]
             try:
-                value = eval(value)
-            except:
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 pass
             override_dict[key] = value
         return override_dict

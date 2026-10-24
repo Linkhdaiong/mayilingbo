@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================================
-# 灵波具身大模型挑战赛 · Stage-2 续训（终局冲刺）
+# 灵波具身大模型挑战赛 · 一次性最终微调（终局冲刺）
 #
 # 起点 : 已提交权重 global_step_45000/hf_ckpt（F32，53.90%）
-# 目标 : 在同一份 release 数据上做第二轮训练，提升 clean2random（34.84%）并整体提分
+# 目标 : 只启动这一轮微调，在同一份 release 数据上提高 clean2random 并整体提分
 #
 # 与 stage-1 的差别（每一项都有明确依据，见 灵波挑战赛_终局冲刺方案.md）：
 #   1. 任务均衡采样        data.task_balanced=true
 #   2. 增广扩到五轴近似    data.image_augment=true + LINGBOT_AUG_CFG（代码内默认已开）
 #   3. 低运动窗口降权      data.adv_weight_path=<motion_weights 目录>
 #   4. 训练期 EMA          train.ema_decay=0.999（官方 DCP/HF 通路自动导出 ema_hf_ckpt）
-#   5. 温和重启 lr 2e-5 → 2e-6 cosine，batch 32 → 64
-#   6. 步数不写死：4.44 s/step 是 batch 32 的实测，batch 64 下约 8.9–10.7 s/step，
-#      34 h 窗口内 MAX_STEPS 由吞吐探针反算（公式见方案 §3），预期落在 10,000 步
-#      = 0.64M 样本 = stage-1（1.44M）的 44%；数据集 ≈ 496K 帧，累计 ≈ 4.2 epoch。
-#      下面 MAX_STEPS 的默认值 25000 只是上限，起跑前必须用探针结果覆盖。
+#   5. 温和重启 lr 2e-5 → 2e-6 cosine，8 卡全局 batch 64
+#   6. 同一次运行完成 25000 个 optimizer step；旧单卡吞吐不能推算 8 卡耗时。
 #
 # 路径配置（换机必读）：
-#   本脚本覆盖 model_path / train_path / output_dir / tokenizer_path / robot_config_root，
+#   本脚本从 configs/local_paths.sh 读取 model_path / train_path / output_dir /
+#   tokenizer_path / robot_config_root 和教师权重路径，
 #   并在启动前把 4 个教师权重路径写进 yaml。官方参数解析器只支持整块替换 align_params，
 #   不支持点路径覆盖，所以这里直接改文件而不是传命令行：
 #     MOGE_PATH        -> align_params.depth.moge_path
@@ -46,35 +44,67 @@
 set -euo pipefail
 
 V2_ROOT=${V2_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-TRAIN_ENV=${TRAIN_ENV:-$V2_ROOT/../../miniconda3/envs/lingbotvla}
+PATH_CONFIG=${PATH_CONFIG:-$V2_ROOT/configs/local_paths.sh}
+if [ ! -f "$PATH_CONFIG" ]; then
+  echo "[final] 路径配置文件不存在：$PATH_CONFIG" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+source "$PATH_CONFIG"
+TRAIN_ENV=${TRAIN_ENV:?需要设置 TRAIN_ENV（训练环境的绝对路径）}
+if [ ! -x "$TRAIN_ENV/bin/python" ] || [ ! -x "$TRAIN_ENV/bin/torchrun" ]; then
+  echo "[final] TRAIN_ENV 必须包含 bin/python 和 bin/torchrun" >&2
+  exit 2
+fi
+export PATH="$TRAIN_ENV/bin:$PATH"
 OUT_DIR=${OUT_DIR:?需要设置 OUT_DIR（训练输出目录，不得已存在）}
 LOG_DIR=${LOG_DIR:-${OUT_DIR}.logs}
 BASE_HF_CKPT=${BASE_HF_CKPT:?需要设置 BASE_HF_CKPT（stage-1 的 hf_ckpt 目录）}
-DATA_MANIFEST=${DATA_MANIFEST:-}
-TOKENIZER_PATH=${TOKENIZER_PATH:-}   # 可选；非空时覆盖 model.tokenizer_path（换机必填）
+DATA_MANIFEST=${DATA_MANIFEST:?需要设置 DATA_MANIFEST（release 训练清单）}
+TOKENIZER_PATH=${TOKENIZER_PATH:?需要设置 TOKENIZER_PATH（本地 Qwen3-VL 目录）}
 ROBOT_CONFIG_ROOT=${ROBOT_CONFIG_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/configs/robot_configs}
 MOGE_PATH=${MOGE_PATH:?需要设置 MOGE_PATH（moge2-vitb-normal.pt）}
 MORGBD_PATH=${MORGBD_PATH:?需要设置 MORGBD_PATH（LingBot-Depth 权重）}
 DINO_VIDEO_CKPT=${DINO_VIDEO_CKPT:?需要设置 DINO_VIDEO_CKPT（teacher_step_10000.pth）}
 DINO_VIDEO_CFG=${DINO_VIDEO_CFG:?需要设置 DINO_VIDEO_CFG（dino_video 的 config.yaml）}
-MOTION_WEIGHTS=${MOTION_WEIGHTS:-}   # 目录，内含 <data_name>.pt；见 tools/build_motion_weights.py
+MOTION_WEIGHTS=${MOTION_WEIGHTS:?需要设置 MOTION_WEIGHTS（运动权重目录）}
 
 MAX_STEPS=${MAX_STEPS:-25000}
 # 5000 而非 2500：单份 DCP ≈63.8 GB（fp32 模型 25.5 + EMA bf16 12.75 + Muon 动量 fp32 25.5），
 # 2500 步要存 10 份 ≈638 GB，超出现有磁盘预算；5000 步存 5 份 ≈319 GB，且 20k 仍在保存点上。
 SAVE_STEPS=${SAVE_STEPS:-5000}
 # 显存不足时的降级阶梯（**保持全局 batch = 64**，只换组合）：
-#   8 × 8（默认） → 4 × 16 → 2 × 32
-# 不要用 6 × 10 这类组合：那会把有效 batch 改成 60，等于改了训练配方。
-MICRO_BS=${MICRO_BS:-8}
-GA=${GA:-8}
-GLOBAL_BS=${GLOBAL_BS:-$((MICRO_BS * GA))}
+#   每卡 2 × 8 卡 × GA 4 = 64；显存不足时改为每卡 1、GA 8，保持全局 batch 64。
+MICRO_BS=${MICRO_BS:-2}
+GA=${GA:-4}
 LR=${LR:-2e-5}
 LR_MIN=${LR_MIN:-2e-6}
 EMA_DECAY=${EMA_DECAY:-0.999}
 SAVE_HF=${SAVE_HF:-false}
 
 cd "$V2_ROOT"
+
+if [ -n "${GPU_IDS:-}" ] && [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && [ "$GPU_IDS" != "$CUDA_VISIBLE_DEVICES" ]; then
+  echo "[final] GPU_IDS 与 CUDA_VISIBLE_DEVICES 不一致" >&2
+  exit 2
+fi
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-${GPU_IDS:-0,1,2,3,4,5,6,7}}
+IFS=',' read -r -a _visible_gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
+if [ -n "${NPROC_PER_NODE:-}" ] && [ "$NPROC_PER_NODE" != "${#_visible_gpu_ids[@]}" ]; then
+  echo "[final] NPROC_PER_NODE 与可见 GPU 数不一致" >&2
+  exit 2
+fi
+NPROC_PER_NODE=${#_visible_gpu_ids[@]}
+if [ "$NPROC_PER_NODE" -ne 8 ]; then
+  echo "[final] 目标机器要求 8 卡，当前可见进程数为 $NPROC_PER_NODE；请检查 CUDA_VISIBLE_DEVICES" >&2
+  exit 2
+fi
+GLOBAL_BS=${GLOBAL_BS:-$((MICRO_BS * GA * NPROC_PER_NODE))}
+EXPECTED_GLOBAL_BS=$((MICRO_BS * GA * NPROC_PER_NODE))
+if [ "$GLOBAL_BS" -ne "$EXPECTED_GLOBAL_BS" ]; then
+  echo "[final] global batch 错误：$GLOBAL_BS != $MICRO_BS x $NPROC_PER_NODE x $GA = $EXPECTED_GLOBAL_BS" >&2
+  exit 2
+fi
 
 if [ -e "$OUT_DIR" ]; then
   echo "[stage2] 输出目录已存在，拒绝启动以免覆盖：$OUT_DIR" >&2
@@ -93,10 +123,17 @@ if [ "$missing" = 1 ]; then
   exit 2
 fi
 BASE_YAML=${BASE_YAML:-configs/vla/robotwin/robotwin.yaml}
+if [[ "$BASE_YAML" != /* ]]; then BASE_YAML="$V2_ROOT/$BASE_YAML"; fi
+for f in "$DATA_MANIFEST" "$BASE_YAML"; do
+  [ -f "$f" ] || { echo "[final] 文件不存在：$f" >&2; exit 2; }
+done
+for d in "$TOKENIZER_PATH" "$ROBOT_CONFIG_ROOT" "$MOTION_WEIGHTS"; do
+  [ -d "$d" ] || { echo "[final] 目录不存在：$d" >&2; exit 2; }
+done
 # 官方解析器无法按点路径覆盖 align_params，启动前把 4 个路径写进 yaml 副本再训练
 RUN_YAML="$LOG_DIR/robotwin.run.yaml"
 mkdir -p "$LOG_DIR"
-python3 - "$V2_ROOT/$BASE_YAML" "$RUN_YAML" "$MOGE_PATH" "$MORGBD_PATH" "$DINO_VIDEO_CKPT" "$DINO_VIDEO_CFG" <<'PY'
+"$TRAIN_ENV/bin/python" - "$BASE_YAML" "$RUN_YAML" "$MOGE_PATH" "$MORGBD_PATH" "$DINO_VIDEO_CKPT" "$DINO_VIDEO_CFG" <<'PY'
 import sys, yaml
 src, dst, moge, morgbd, ckpt, cfg = sys.argv[1:]
 doc = yaml.safe_load(open(src, encoding="utf-8"))
@@ -106,10 +143,17 @@ video["ckpt_path"], video["config_path"] = ckpt, cfg
 yaml.safe_dump(doc, open(dst, "w", encoding="utf-8"), allow_unicode=True, sort_keys=False)
 PY
 echo "[stage2] 已写入教师权重路径 -> $RUN_YAML"
+if [ "${CHECK_ONLY:-0}" = 1 ]; then
+  echo "[final] 配置检查通过：$NPROC_PER_NODE ranks，batch=$GLOBAL_BS；未启动训练。"
+  exit 0
+fi
 mkdir -p "$OUT_DIR"
 
 export PATH="$TRAIN_ENV/bin:$PATH"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NPROC_PER_NODE - 1)))
+  export CUDA_VISIBLE_DEVICES
+fi
 export MASTER_ADDR=127.0.0.1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
@@ -126,11 +170,11 @@ else
   echo "[stage2] 警告：未提供 MOTION_WEIGHTS（应为目录），低运动降权不会生效（其余项照常）"
 fi
 
-echo "================ stage-2 配置 ================"
+echo "================ 一次性最终微调配置 ================"
 echo "BASE_HF_CKPT  = $BASE_HF_CKPT"
 echo "OUT_DIR       = $OUT_DIR"
 echo "MAX_STEPS     = $MAX_STEPS   SAVE_STEPS = $SAVE_STEPS"
-echo "batch         = $MICRO_BS x $GA = $GLOBAL_BS"
+echo "batch         = $MICRO_BS x $NPROC_PER_NODE x $GA = $GLOBAL_BS"
 echo "lr            = $LR -> $LR_MIN (cosine)"
 echo "ema_decay     = $EMA_DECAY   save_hf_weights = $SAVE_HF"
 echo "tokenizer     = ${TOKENIZER_PATH:-<yaml 里的占位符>}"
@@ -138,7 +182,7 @@ echo "motion weights= ${MOTION_WEIGHTS:-<none>}  (目录形式)"
 echo "=============================================="
 
 set +e
-torchrun --standalone --nnodes=1 --nproc-per-node=1 \
+torchrun --standalone --nnodes=1 --nproc-per-node="$NPROC_PER_NODE" \
   tasks/vla/train_lingbotvla.py "$RUN_YAML" \
   --model.model_path="$BASE_HF_CKPT" \
   --train.output_dir="$OUT_DIR" \
@@ -151,6 +195,7 @@ torchrun --standalone --nnodes=1 --nproc-per-node=1 \
   --train.lr_decay_style=cosine --train.lr_warmup_ratio=0.01 \
   --train.enable_gradient_checkpointing=true \
   --train.enable_fp32=true \
+  --train.enable_full_shard=true \
   --train.use_compile=true \
   --train.ema_decay="$EMA_DECAY" --train.ema_dtype=bfloat16 \
   --train.save_hf_weights="$SAVE_HF" \
@@ -169,6 +214,6 @@ printf 'exit_code=%s\n' "$rc" > "$LOG_DIR/status"
 echo "[stage2] torchrun exit_code=$rc；日志：$LOG_DIR/train.log；产物：$OUT_DIR"
 echo "[stage2] 导出可评测权重："
 echo "  python tools/export_hf_from_dcp.py --dcp $OUT_DIR/checkpoints/global_step_$MAX_STEPS \\"
-echo "      --assets-from $BASE_HF_CKPT --out <hf_dir>          # 普通权重"
+echo "      --assets-from $OUT_DIR/model_assets --out <hf_dir>          # 普通权重"
 echo "  python tools/export_hf_from_dcp.py --ema ... （同上）    # EMA 权重"
 exit "$rc"

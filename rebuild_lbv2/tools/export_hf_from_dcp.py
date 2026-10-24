@@ -36,6 +36,7 @@ import glob
 import os
 import shutil
 import sys
+import tempfile
 
 import torch
 
@@ -77,10 +78,12 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 3
 
-    tmp = args.out + ".tmp"
-    if os.path.exists(tmp):
-        shutil.rmtree(tmp)
-    os.makedirs(tmp, exist_ok=True)
+    if not os.path.isfile(os.path.join(args.assets_from, "config.json")):
+        print("assets-from 必须包含本轮训练的 config.json", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=os.path.basename(args.out) + ".", suffix=".tmp",
+                           dir=os.path.dirname(os.path.abspath(args.out)))
 
     print(f"[export] DCP={args.dcp} ema={args.ema} dtype={args.dtype}")
     state_dict = ckpt_to_state_dict(
@@ -103,6 +106,8 @@ def main(argv=None) -> int:
     n_copied = 0
     for pattern in NON_WEIGHT_PATTERNS:
         for src in glob.glob(os.path.join(args.assets_from, pattern)):
+            if os.path.basename(src).endswith(".index.json"):
+                continue
             dst = os.path.join(tmp, os.path.basename(src))
             if os.path.isfile(src) and not os.path.exists(dst):
                 shutil.copy2(src, dst)

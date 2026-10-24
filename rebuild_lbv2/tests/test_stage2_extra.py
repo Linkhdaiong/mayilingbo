@@ -140,7 +140,8 @@ def test_ema_moves_towards_model_and_roundtrips():
         ema.update(m)
 
     for n, p in ema.named_parameters():
-        assert torch.allclose(p, m.state_dict()[n], atol=1e-2), n
+        expected = before[n] * (0.9 ** 30) + m.state_dict()[n] * (1 - 0.9 ** 30)
+        assert torch.allclose(p, expected, atol=1e-6), n
         assert not torch.allclose(p, before[n]), n
 
     sd = ema.state_dict()
@@ -157,6 +158,22 @@ def test_ema_rejects_bad_decay():
         EMAModel(_Tiny(), decay=0.0)
     with pytest.raises(ValueError):
         EMAModel(_Tiny(), decay=1.0)
+
+
+def test_compiled_model_ema_has_canonical_checkpoint_keys():
+    from lingbotvla.utils.ema_model import EMAModel
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+    model = torch.compile(_Tiny())
+    ema = EMAModel(model, decay=0.9, dtype=torch.float32)
+    assert set(get_model_state_dict(ema)) == set(get_model_state_dict(model))
+    before = {name: p.clone() for name, p in ema.named_parameters()}
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1)
+    ema.update(model)
+    for name, p in ema.named_parameters():
+        torch.testing.assert_close(p, before[name] + 0.1)
 
 
 def test_ema_bf16_shadow_is_not_frozen():

@@ -143,7 +143,7 @@ def _read_actions(root: str, lengths: Sequence[int]) -> np.ndarray:
         got = int(mask.sum())
         if got != int(ln):
             raise ValueError(f"episode {e} 帧数 {got} != meta 声明的 {ln}")
-        if got and (fr[mask].min() != 0 or fr[mask].max() != got - 1):
+        if got and not np.array_equal(fr[mask], np.arange(got)):
             raise ValueError(f"episode {e} 的 frame_index 不是 0..{got-1} 连续")
     return act
 
@@ -160,6 +160,12 @@ def motion_weights(
     power: float = 0.5,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, dict]:
+    if actions.ndim != 2 or not actions.size or not np.isfinite(actions).all():
+        raise ValueError("actions 必须是非空、有限的二维数组")
+    if not lengths or any(int(n) != n or n <= 0 for n in lengths) or sum(lengths) != len(actions):
+        raise ValueError("episode 长度必须为正整数且总和等于动作帧数")
+    if not isinstance(window, int) or window < 1 or not (0 < lo <= hi) or power <= 0:
+        raise ValueError("要求 window>=1、0<lo<=hi、power>0")
     a = actions.astype(np.float32, copy=False)
     scale = a.std(axis=0)
     scale = np.where(scale < eps, 1.0, scale).astype(np.float32)
@@ -175,12 +181,16 @@ def motion_weights(
             delta[off + ln - 1] = d[-1]
         off += ln
 
-    # 窗口平滑（两端用 edge padding，避免尾部被压低）
+    # 每条轨迹独立平滑，窗口不得跨 episode 边界。
     if window > 1:
         pad = window // 2
-        padded = np.pad(delta, (pad, window - 1 - pad), mode="edge")
         kernel = np.ones(window, dtype=np.float32) / window
-        motion = np.convolve(padded, kernel, mode="valid")
+        motion = np.empty_like(delta)
+        off = 0
+        for ln in lengths:
+            padded = np.pad(delta[off:off + ln], (pad, window - 1 - pad), mode="edge")
+            motion[off:off + ln] = np.convolve(padded, kernel, mode="valid")
+            off += ln
     else:
         motion = delta
 
@@ -210,11 +220,13 @@ def _iter_manifest(path: str) -> List[Tuple[str, str]]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#"):
                 continue
             parts = line.split()
             if len(parts) < 2:
                 raise ValueError(f"清单行格式异常（需要 '<data_name> <repo_path>'）：{line!r}")
+            if parts[0] in {name for name, _ in out}:
+                raise ValueError(f"清单任务名重复：{parts[0]}")
             out.append((parts[0], parts[1]))
     return out
 

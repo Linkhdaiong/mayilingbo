@@ -157,6 +157,9 @@ class EMAModel(nn.Module):
         log_interval: int = 100,
     ) -> None:
         super().__init__()
+        # DCP canonicalizes compiled models; mirror the original module so EMA
+        # has the same checkpoint keys as the main model.
+        model = getattr(model, "_orig_mod", model)
         if not (0.0 < decay < 1.0):
             raise ValueError(f"ema decay 必须在 (0, 1) 区间内，收到 {decay}")
         self.decay = float(decay)
@@ -211,6 +214,7 @@ class EMAModel(nn.Module):
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         """在 ``optimizer.step()`` 之后调用一次。"""
+        model = getattr(model, "_orig_mod", model)
         decay = self.decay
         alpha = 1.0 - decay
         src_params = dict(model.named_parameters())
@@ -242,6 +246,7 @@ class EMAModel(nn.Module):
         可观测性入口（也供测试调用）：bf16 影子被舍入吞掉时该值恒为 0。
         抽样按参数名等间距取，避免只看第一层（embedding）而误判整体。
         """
+        model = getattr(model, "_orig_mod", model)
         src_params = dict(model.named_parameters())
         dst_params = dict(self.named_parameters())
         names = [n for n in self._param_names if n in src_params and n in dst_params]
@@ -285,6 +290,7 @@ class EMAModel(nn.Module):
     @torch.no_grad()
     def copy_to(self, model: nn.Module) -> None:
         """把 EMA 权重写回主模型（仅调试/导出验证用；正式流程走 ``ema_hf_ckpt``）。"""
+        model = getattr(model, "_orig_mod", model)
         src_params = dict(self.named_parameters())
         for name, dst in model.named_parameters():
             src = src_params.get(name)

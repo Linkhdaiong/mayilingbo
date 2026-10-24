@@ -27,29 +27,41 @@
 #   --use_compile       enable model compile in policy inference (default: True)
 #   --task_config       RoboTwin task config (default: demo_clean, or $TASK_CONFIG)
 #   --keep_inference    keep inference servers resident after simulation
+#   --dvac_args         extra DVAC arguments, or set DVAC_ARGS in local_paths.sh
 #
 # Examples:
 #   bash start_robotwin_infer_and_eval.sh --eval_workdir /path/to/RoboTwin --num_tasks 50 --num_gpus 4 --num_per_gpu 1
 #   bash start_robotwin_infer_and_eval.sh --eval_workdir /path/to/RoboTwin --sim_env RoboTwin --num_tasks 20 --num_per_gpu 2
 # ============================================================
 
-# ===== Parse keyword arguments =====
-export QWEN3VL_PATH="${QWEN3VL_PATH:-/path/to/your/checkpoints/Qwen3-VL-4B-Instruct}"
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PATH_CONFIG=${PATH_CONFIG:-${project_root}/configs/local_paths.sh}
+if [ ! -f "$PATH_CONFIG" ]; then
+    echo -e "\033[31mError: local path config not found: ${PATH_CONFIG}\033[0m"
+    exit 2
+fi
+# shellcheck disable=SC1090
+source "$PATH_CONFIG"
+export QWEN3VL_PATH="${QWEN3VL_PATH:-}"
 
-project_root="$(pwd)"
-inference_workdir="${project_root}/"
+inference_workdir="${INFERENCE_WORKDIR:-${project_root}}"
 inference_script="deploy/lingbot_vla_v2_policy.py"
-model_path="${MODEL_PATH:-/path/to/your/checkpoint}"
-eval_workdir="${EVAL_WORKDIR:-/path/to/RoboTwin}"
-output_base="${OUTPUT_BASE:-/path/to/VLABenchmarkResult}"
+model_path="${MODEL_PATH:-}"
+eval_workdir="${EVAL_WORKDIR:-}"
+output_base="${OUTPUT_BASE:-}"
 # Conda env names + conda.sh path for both sides (overridable via flags or env).
 inference_env="${INFERENCE_ENV:-lingbotvla}"
 sim_env="${SIM_ENV:-RoboTwin}"
-conda_sh="${CONDA_SH:-/path/to/miniconda3/etc/profile.d/conda.sh}"
+conda_sh="${CONDA_SH:-}"
 start_port=9330
 pid_name="test_pid"
 num_tasks=50
-num_gpus=1
+num_gpus=${NUM_GPUS:-1}
+if [ -n "${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}" ]; then
+    GPU_IDS=${GPU_IDS:-$CUDA_VISIBLE_DEVICES}
+    IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
+    num_gpus=${#gpu_ids[@]}
+fi
 num_per_gpu=1
 use_length=50
 use_bf16=False
@@ -59,8 +71,9 @@ robo_name="robotwin"
 video_fps=10
 enable_video=True
 keep_inference=false
-enable_video=False
 task_config="${TASK_CONFIG:-demo_clean}"
+instruction_type="${INSTRUCTION_TYPE:-seen}"
+DVAC_ARGS="${DVAC_ARGS:-}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -80,7 +93,9 @@ while [[ $# -gt 0 ]]; do
         --use_compile)       use_compile="$2";     shift 2 ;;
         --robo_name)         robo_name="$2";         shift 2 ;;
         --task_config)       task_config="$2";       shift 2 ;;
+        --instruction_type)  instruction_type="$2";  shift 2 ;;
         --video_fps)         video_fps="$2";         shift 2 ;;
+        --dvac_args)         DVAC_ARGS="$2";         shift 2 ;;
         --no_video)          enable_video=False;     shift ;;
         --keep_inference)    keep_inference=true;    shift ;;
         --inference_env)     inference_env="$2";     shift 2 ;;
@@ -107,15 +122,39 @@ while [[ $# -gt 0 ]]; do
             echo "  --use_compile       enable model compile (default: True)"
             echo "  --robo_name         robot config name (default: robotwin)"
             echo "  --task_config       RoboTwin task config (default: demo_clean)"
+            echo "  --instruction_type  seen (clean) or unseen (randomized)"
             echo "  --keep_inference    keep inference servers resident after simulation"
             echo "  --video_fps         video recording fps (default: 10)"
             echo "  --no_video          disable video recording to speed up simulation"
+            echo "  --dvac_args         extra DVAC arguments (or set DVAC_ARGS in local_paths.sh)"
             exit 0 ;;
         *)
             echo -e "\033[31mUnknown argument: $1\033[0m"; exit 1 ;;
     esac
 done
 
+for value in "$num_gpus" "$num_per_gpu" "$num_tasks" "$use_length"; do
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "GPU/task/chunk counts must be positive integers" >&2
+        exit 2
+    fi
+done
+if [ -z "$model_path" ] || [ ! -d "$model_path" ]; then
+    echo -e "\033[31mError: MODEL_PATH/--model_path must point to an existing HF checkpoint\033[0m"
+    exit 2
+fi
+if [ -z "$output_base" ]; then
+    echo -e "\033[31mError: OUTPUT_BASE must be set in local_paths.sh or --output_base\033[0m"
+    exit 2
+fi
+if [ -z "$conda_sh" ]; then
+    echo -e "\033[31mError: CONDA_SH must be set in local_paths.sh or --conda_sh\033[0m"
+    exit 2
+fi
+DVAC_ARGS_ARRAY=()
+if [ -n "$DVAC_ARGS" ]; then
+    read -r -a DVAC_ARGS_ARRAY <<< "$DVAC_ARGS"
+fi
 
 # ===== Common environment =====
 # Cleanup: kill all child processes on exit / Ctrl-C / kill
@@ -150,7 +189,9 @@ cleanup() {
     done
     echo -e "\033[33m=== Cleanup done ===\033[0m"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 
 
@@ -224,6 +265,17 @@ done
 echo -e "\033[36mTasks this run (${num_tasks}): ${task_queue[*]}\033[0m"
 echo -e "\033[36mInference config: ${num_gpus} GPU x ${num_per_gpu} servers/GPU = ${num_slots} slots\033[0m"
 echo -e "\033[36mInference precision: use_bf16=${use_bf16}, use_fp32=${use_fp32}, use_compile=${use_compile}\033[0m"
+if [ -n "${GPU_IDS:-}" ]; then
+    IFS=',' read -r -a gpu_ids <<< "$GPU_IDS"
+else
+    gpu_ids=()
+    for ((i = 0; i < num_gpus; i++)); do gpu_ids+=("$i"); done
+fi
+if [ "${#gpu_ids[@]}" -ne "$num_gpus" ]; then
+    echo -e "\033[31mError: GPU_IDS contains ${#gpu_ids[@]} IDs but --num_gpus=${num_gpus}\033[0m"
+    exit 2
+fi
+echo -e "\033[36mPhysical inference GPU IDs: ${gpu_ids[*]}\033[0m"
 
 # ===== Common variables =====
 batch_time=$(date +%Y%m%d_%H%M%S)
@@ -255,7 +307,7 @@ echo -e "\033[32m========== Starting inference side: ${num_slots} QwenPi servers
 cd "$inference_workdir" || { echo -e "\033[31mError: inference workdir ${inference_workdir} missing\033[0m"; exit 1; }
 
 for slot in $(seq 0 $((num_slots-1))); do
-    gpu_id=$(( slot % num_gpus ))
+    gpu_id="${gpu_ids[$((slot % num_gpus))]}"
     port=$(( start_port + slot ))
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
@@ -270,13 +322,11 @@ for slot in $(seq 0 $((num_slots-1))); do
         inference_script_for_module="${inference_script_for_module#${inference_workdir%/}/}"
     fi
     inference_module=$(echo "${inference_script_for_module}" | sed 's|/|.|g; s|\.py$||')
-    setsid bash -c "source ${conda_sh} && conda activate ${inference_env} && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python -m ${inference_module} \
-        --model_path '${model_path}' \
-        --use_length '${use_length}' \
-        --use_bf16 "${use_bf16}" \
-        --use_fp32 "${use_fp32}" \
-        --use_compile "${use_compile}" \
-        --port '${port}'" > "$log_file" 2>&1 &
+    setsid bash -c 'source "$1" && conda activate "$2" && shift 2 && exec env SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python "$@"' \
+        _ "$conda_sh" "$inference_env" -m "$inference_module" \
+        --model_path "$model_path" --use_length "$use_length" \
+        --use_bf16 "$use_bf16" --use_fp32 "$use_fp32" --use_compile "$use_compile" \
+        --chunk_ret true "${DVAC_ARGS_ARRAY[@]}" --port "$port" > "$log_file" 2>&1 &
 
     pid=$!
     echo "${pid}" >> "$inference_pid_file"
@@ -308,7 +358,7 @@ cd "$eval_workdir" || { echo -e "\033[31mError: sim workdir ${eval_workdir} miss
 # ===== Ensure the lingbot eval client is present under RoboTwin/script =====
 # The eval client resolves its ../task_config relative to its own location, so it
 # must live at <RoboTwin>/script/ for _camera_config.yml to be found.
-eval_client_src="${inference_workdir}experiment/robotwin/eval_policy_client_lingbotvla.py"
+eval_client_src="${inference_workdir%/}/experiment/robotwin/eval_policy_client_lingbotvla.py"
 eval_client_dst="${eval_workdir}/script/eval_policy_client_lingbotvla.py"
 if [ ! -f "$eval_client_dst" ]; then
     if [ ! -f "$eval_client_src" ]; then
@@ -317,12 +367,15 @@ if [ ! -f "$eval_client_dst" ]; then
     fi
     echo -e "\033[36mCopying eval client -> ${eval_client_dst}\033[0m"
     cp "$eval_client_src" "$eval_client_dst"
+elif ! cmp -s "$eval_client_src" "$eval_client_dst"; then
+    echo "Error: RoboTwin eval client differs from this checkout; install the reviewed client before evaluation: $eval_client_src -> $eval_client_dst" >&2
+    exit 2
 fi
 
 # ===== Ensure the deploy client helpers are present under RoboTwin/script/deploy =====
 # The eval client does `from script.deploy.websocket_client_policy import WebsocketClientPolicy`,
 # which pulls in a sibling msgpack_numpy. Copy any that are missing from the inference repo.
-deploy_pkg_src="${inference_workdir}deploy"
+deploy_pkg_src="${inference_workdir%/}/deploy"
 deploy_pkg_dst="${eval_workdir}/script/deploy"
 mkdir -p "$deploy_pkg_dst"
 for f in __init__.py websocket_client_policy.py msgpack_numpy.py; do
@@ -347,11 +400,11 @@ _eval_resolved="$(pwd -P)"   # physical path of this RoboTwin checkout (after cd
 _rep_yml="assets/embodiments/aloha-agilex/curobo_left.yml"
 if [ -f "$_rep_yml" ] && ! grep -qF "${_eval_resolved}/assets" "$_rep_yml" 2>/dev/null; then
     echo -e "\033[36mCurobo yml paths stale -> regenerating for ${_eval_resolved}\033[0m"
-    ( source ${conda_sh} && conda activate ${sim_env} \
+    ( source "$conda_sh" && conda activate "$sim_env" \
       && python script/update_embodiment_config_path.py ) \
       || { echo -e "\033[31mError: curobo path regeneration failed\033[0m"; exit 1; }
 fi
-_env_site="$( source ${conda_sh} && conda activate ${sim_env} \
+_env_site="$( source "$conda_sh" && conda activate "$sim_env" \
     && python -c 'import site;print(site.getsitepackages()[0])' )"
 _curobo_pth="$(echo "${_env_site}"/__editable__.nvidia_curobo-*.pth)"
 _expected_curobo_src="${_eval_resolved}/envs/curobo/src"
@@ -393,7 +446,7 @@ done
 launch_task() {
     local slot=$1
     local task_name=$2
-    local gpu_id=$(( slot % num_gpus ))
+    local gpu_id="${gpu_ids[$((slot % num_gpus))]}"
     local port=$(( start_port + slot ))
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
@@ -421,18 +474,13 @@ launch_task() {
     PYTHONWARNINGS=ignore::UserWarning \
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
-        --overrides \
-        --task_name ${task_name} \
-        --task_config ${task_config} \
-        --train_config_name ${train_config_name} \
-        --seed ${seed} \
-        --policy_name ${policy_name} \
-        --port ${port} \
-        --robo_name ${robo_name} \
-        --video_fps ${video_fps} \
-        --eval_video_log ${enable_video} \
-        --output_dir '${run_dir}/eval_results'" >> "$log_file" 2>&1 &
+    setsid bash -c 'source "$1" && conda activate "$2" && shift 2 && export PYTHONNOUSERSITE=1 && exec python -u "$@"' \
+        _ "$conda_sh" "$sim_env" "$eval_client_dst" --config "policy/${policy_name}/deploy_policy.yml" \
+        --overrides --task_name "$task_name" --task_config "$task_config" \
+        --train_config_name "$train_config_name" --seed "$seed" --policy_name "$policy_name" \
+        --instruction_type "$instruction_type" \
+        --port "$port" --robo_name "$robo_name" --video_fps "$video_fps" \
+        --eval_video_log "$enable_video" --output_dir "${run_dir}/eval_results" >> "$log_file" 2>&1 &
 
     local pid=$!
     echo "${pid}" >> "$eval_pid_file"
@@ -466,7 +514,7 @@ shutdown_inference_slot() {
 # Phase 3: scheduling loop - detect finished slots, reclaim and dispatch
 # ============================================================
 completed=0
-skipped=0
+incomplete=0
 total_tasks=${#task_queue[@]}
 
 # Exit when all tasks done/skipped and nothing running
@@ -487,7 +535,7 @@ remaining_tasks() {
     echo $((running + queued))
 }
 
-while [ $((completed + skipped)) -lt $total_tasks ] && has_running; do
+while [ $((completed + incomplete)) -lt $total_tasks ] && has_running; do
     for slot in $(seq 0 $((num_slots-1))); do
         pid=${slot_pid[$slot]}
 
@@ -529,9 +577,9 @@ while [ $((completed + skipped)) -lt $total_tasks ] && has_running; do
                     # Retry immediately on the same slot
                     launch_task $slot "$task_name"
                 else
-                    skipped=$((skipped + 1))
-                    echo -e "\033[31m  [skip] ${task_name} failed ${max_retries} times, no more retries\033[0m"
-                    result_status+=("skip:${exit_code}")
+                    incomplete=$((incomplete + 1))
+                    echo -e "\033[31m  [incomplete] ${task_name} failed ${max_retries} times; result is invalid\033[0m"
+                    result_status+=("incomplete:${exit_code}")
                     result_task_names+=("$task_name")
                     result_durations+=("$task_duration")
                     result_logs+=("$log_file")
@@ -554,6 +602,7 @@ while [ $((completed + skipped)) -lt $total_tasks ] && has_running; do
     # Adaptive shutdown: when remaining tasks < active inference servers, stop idle-slot servers
     remaining=$(remaining_tasks)
     for slot in $(seq 0 $((num_slots-1))); do
+        $keep_inference && break
         [ $remaining -lt $active_inference ] || break
         if [ "${slot_pid[$slot]}" = "0" ] && [ "${inference_pids[$slot]}" != "0" ]; then
             shutdown_inference_slot $slot
@@ -566,8 +615,8 @@ done
 total_end_time=$(date +%s)
 total_duration=$(( total_end_time - total_start_time ))
 
-if [ $skipped -gt 0 ]; then
-    echo -e "\033[31m========== Sim finished: ${completed} done, ${skipped} skipped, total ${total_duration}s ==========\033[0m"
+if [ $incomplete -gt 0 ]; then
+    echo -e "\033[31m========== Sim incomplete: ${completed} done, ${incomplete} incomplete, total ${total_duration}s ==========\033[0m"
 else
     echo -e "\033[32m========== All sim tasks done, total ${total_duration}s ==========\033[0m"
 fi
@@ -587,7 +636,7 @@ echo -e "\033[36mGenerating stats file: ${stats_file}\033[0m"
     echo "  Task Config: ${task_config}"
     echo "  Inference: ${num_gpus} GPU x ${num_per_gpu}/GPU = ${num_slots} slots"
     echo "  Precision: use_bf16=${use_bf16}, use_fp32=${use_fp32}, use_compile=${use_compile}"
-    echo "  Result: ${completed} done, ${skipped} skipped"
+    echo "  Result: ${completed} done, ${incomplete} incomplete"
     echo "============================================"
     echo ""
     printf "%-30s %-10s %-12s %-10s %-10s\n" "Task" "Time(s)" "Done(100)" "Success/Total" "Rate"
@@ -622,7 +671,10 @@ echo -e "\033[36mGenerating stats file: ${stats_file}\033[0m"
         fi
 
         # Check whether all 100 episodes ran
-        if [ "$episodes_done" != "-" ]; then
+        if [ "$status" != "done" ]; then
+            complete_mark="FAILED"
+            all_complete=false
+        elif [ "$episodes_done" != "-" ]; then
             total_ep=$(echo "$episodes_done" | cut -d'/' -f2)
             if [ "$total_ep" = "100" ]; then
                 complete_mark="YES"
@@ -645,19 +697,27 @@ echo -e "\033[36mGenerating stats file: ${stats_file}\033[0m"
         overall_rate="0.0"
     fi
     printf "Summary: total %ds, success %d/%d, overall rate %s%%\n" "$total_duration" "$total_success" "$total_episodes" "$overall_rate"
-    if $all_complete; then
+    if $all_complete && [ "${#result_task_names[@]}" -eq "$total_tasks" ]; then
         echo "All tasks fully executed 100 episodes"
     else
-        echo "Warning: some tasks did not complete 100 episodes; check logs"
+        echo "INCOMPLETE: some tasks did not complete 100 episodes; aggregate is not a full score"
+        exit 3
     fi
     echo "============================================"
 } | tee "$stats_file"
+stats_rc=${PIPESTATUS[0]}
+
+if [ "$incomplete" -gt 0 ] || [ "$stats_rc" -ne 0 ] || [ "$completed" -ne "$total_tasks" ]; then
+    echo "Evaluation gate failed: ${incomplete} task(s) did not complete after retries." >&2
+    exit 3
+fi
 
 # ============================================================
 # Phase 5: handle inference servers (stop the remaining ones)
 # ============================================================
 if $keep_inference; then
     alive_count=0
+    trap - EXIT
     for slot in $(seq 0 $((num_slots-1))); do
         [ "${inference_pids[$slot]}" != "0" ] && alive_count=$((alive_count + 1))
     done
